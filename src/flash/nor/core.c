@@ -16,6 +16,7 @@
 #include <flash/nor/core.h>
 #include <flash/nor/imp.h>
 #include <target/image.h>
+#include "chiptype.h"
 
 /**
  * @file
@@ -25,12 +26,41 @@
  */
 
 static struct flash_bank *flash_banks;
+const char *multi_chip_type_array[] = {
+	"3067MBPIDM0",
+	"3067MBPIDM1",
+	"3067MBPIDM2",
+	"3066HAPIMM0",
+	"3066HAPIVM0",
+	"3066HAPIDM0",
+	"3066HNPIDM0",
+	"3066HAPIDM1",
+	"3066HNPIDM1",
+	"3066HAPIMM1",
+	"3066HAPIVM1",
+	"3066HAPIMM2",
+	"3066HAPIVM2",
+	"3066HAPIDM2",
+	"3066HNPIDM2",
+	"3066HAPIMM3",
+	"3066HAPIVM3",
+	"3066HAPIDM3",
+	"3066HNPIDM3",
+};
+
+bool find_chip_in_array(const char *string_array[], int array_size, const char *input) {
+    for (int i = 0; i < array_size; i++) {
+        if (strcmp(input, string_array[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 int flash_driver_erase(struct flash_bank *bank, unsigned int first,
 		unsigned int last)
 {
 	int retval;
-
 	retval = bank->driver->erase(bank, first, last);
 	if (retval != ERROR_OK)
 		LOG_ERROR("failed erasing sectors %u to %u", first, last);
@@ -268,7 +298,7 @@ int get_flash_bank_by_name(const char *name, struct flash_bank **bank_result)
 		retval = bank->driver->auto_probe(bank);
 
 		if (retval != ERROR_OK) {
-			LOG_ERROR("auto_probe failed");
+			LOG_INFO("auto_probe failed");
 			return retval;
 		}
 	}
@@ -288,7 +318,7 @@ int get_flash_bank_by_num(unsigned int num, struct flash_bank **bank)
 	retval = p->driver->auto_probe(p);
 
 	if (retval != ERROR_OK) {
-		LOG_ERROR("auto_probe failed");
+		LOG_INFO("auto_probe failed");
 		return retval;
 	}
 	*bank = p;
@@ -313,7 +343,7 @@ int get_flash_bank_by_addr(struct target *target,
 		retval = c->driver->auto_probe(c);
 
 		if (retval != ERROR_OK) {
-			LOG_ERROR("auto_probe failed");
+			LOG_INFO("auto_probe failed");
 			return retval;
 		}
 		/* check whether address belongs to this flash bank */
@@ -818,6 +848,7 @@ int flash_write_unlock_verify(struct target *target, struct image *image,
 			}
 
 			pad_bytes = next_section_base - run_next_addr;
+#ifndef HISPARK_TRACE_MODIFIES
 			if (pad_bytes) {
 				if (flash_write_check_gap(c, run_next_addr - 1, next_section_base)) {
 					LOG_INFO("Flash write discontinued at " TARGET_ADDR_FMT
@@ -826,6 +857,7 @@ int flash_write_unlock_verify(struct target *target, struct image *image,
 					break;
 				}
 			}
+#endif /* HISPARK_TRACE_MODIFIES */
 			if (pad_bytes > 0)
 				LOG_INFO("Padding image section %d at " TARGET_ADDR_FMT
 					" with %d bytes",
@@ -996,7 +1028,14 @@ done:
 int flash_write(struct target *target, struct image *image,
 	uint32_t *written, bool erase)
 {
+#ifdef HISPARK_TRACE_MODIFIES
+	if (find_chip_in_array(multi_chip_type_array, sizeof(multi_chip_type_array) / sizeof(multi_chip_type_array[0]), chip_type)) {
+		return flash_write_unlock_verify(target, image, written, erase, false, true, false);
+	}
+	return flash_write_unlock_verify(target, image, written, erase, false, true, true);
+#else /* HISPARK_TRACE_MODIFIES */
 	return flash_write_unlock_verify(target, image, written, erase, false, true, false);
+#endif /* HISPARK_TRACE_MODIFIES */
 }
 
 struct flash_sector *alloc_block_array(uint32_t offset, uint32_t size,

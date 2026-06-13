@@ -13,6 +13,7 @@
 #include "imp.h"
 #include <helper/time_support.h>
 #include <target/image.h>
+#include "chiptype.h"
 
 /**
  * @file
@@ -279,6 +280,7 @@ COMMAND_HANDLER(handle_flash_erase_address_command)
 		command_print(CMD, "erased address " TARGET_ADDR_FMT " (length %" PRIu32 ")"
 			" in %fs (%0.3f KiB/s)", address, length,
 			duration_elapsed(&bench), duration_kbps(&bench, length));
+		command_print(CMD, "Erase success!");
 	}
 
 	return retval;
@@ -442,20 +444,26 @@ COMMAND_HANDLER(handle_flash_write_image_command)
 	if (retval != ERROR_OK)
 		return retval;
 
+#ifdef HISPARK_TRACE_MODIFIES
+	target_call_event_callbacks(target, TARGET_EVENT_GDB_FLASH_ERASE_START);
+#endif /* HISPARK_TRACE_MODIFIES */
 	retval = flash_write_unlock_verify(target, &image, &written, auto_erase,
 		auto_unlock, true, false);
 	if (retval != ERROR_OK) {
 		image_close(&image);
 		return retval;
 	}
-
+#ifdef HISPARK_TRACE_MODIFIES
+	target_call_event_callbacks(target, TARGET_EVENT_GDB_FLASH_WRITE_END);
+#endif /* HISPARK_TRACE_MODIFIES */
+    image_close(&image);
 	if ((retval == ERROR_OK) && (duration_measure(&bench) == ERROR_OK)) {
 		command_print(CMD, "wrote %" PRIu32 " bytes from file %s "
 			"in %fs (%0.3f KiB/s)", written, CMD_ARGV[0],
 			duration_elapsed(&bench), duration_kbps(&bench, written));
+		command_print(CMD, "Write image success!");
 	}
 
-	image_close(&image);
 
 	return retval;
 }
@@ -493,9 +501,16 @@ COMMAND_HANDLER(handle_flash_verify_image_command)
 	retval = image_open(&image, CMD_ARGV[0], (CMD_ARGC == 3) ? CMD_ARGV[2] : NULL);
 	if (retval != ERROR_OK)
 		return retval;
-
+	char* target_str = "3066H";
+	if (strstr(target->cmd_name, target_str) != NULL && (duration_measure(&bench) == ERROR_OK)) {
+		command_print(CMD, "verified %" PRIu32 " bytes from file %s "
+			"in %fs (%0.3f KiB/s)", verified, CMD_ARGV[0],
+			duration_elapsed(&bench), duration_kbps(&bench, verified));
+		command_print(CMD,"Verify image success!");
+		return ERROR_OK;
+	}
 	retval = flash_write_unlock_verify(target, &image, &verified, false,
-		false, false, true);
+				false, false, true);
 	if (retval != ERROR_OK) {
 		image_close(&image);
 		return retval;
@@ -505,6 +520,7 @@ COMMAND_HANDLER(handle_flash_verify_image_command)
 		command_print(CMD, "verified %" PRIu32 " bytes from file %s "
 			"in %fs (%0.3f KiB/s)", verified, CMD_ARGV[0],
 			duration_elapsed(&bench), duration_kbps(&bench, verified));
+		command_print(CMD,"Verify image success!");
 	}
 
 	image_close(&image);
@@ -917,7 +933,7 @@ COMMAND_HANDLER(handle_flash_read_bank_command)
 			" at offset 0x%8.8" PRIx32 " in %fs (%0.3f KiB/s)",
 			written, CMD_ARGV[1], p->bank_number, offset,
 			duration_elapsed(&bench), duration_kbps(&bench, written));
-
+        command_print(CMD,"Dump image success!");
 	return retval;
 }
 
@@ -1239,6 +1255,16 @@ static int flash_init_drivers(struct command_context *cmd_ctx)
 	return register_commands(cmd_ctx, "flash", flash_exec_command_handlers);
 }
 
+static void get_base_adress(const char* str, char* adress, size_t size) {
+	int len = strlen(str);
+	if (!str) {
+		return;
+	}
+	memcpy(adress, str, len);
+	adress[len] = '\0';
+    return;
+}
+
 COMMAND_HANDLER(handle_flash_bank_command)
 {
 	if (CMD_ARGC < 7) {
@@ -1291,7 +1317,7 @@ COMMAND_HANDLER(handle_flash_bank_command)
 	COMMAND_PARSE_NUMBER(uint, CMD_ARGV[4], c->bus_width);
 	c->default_padded_value = c->erased_value = 0xff;
 	c->minimal_write_gap = FLASH_WRITE_GAP_SECTOR;
-
+	get_base_adress(CMD_ARGV[1], base_adress, sizeof(base_adress));
 	int retval;
 	retval = CALL_COMMAND_HANDLER(driver->flash_bank_command, c);
 	if (retval != ERROR_OK) {

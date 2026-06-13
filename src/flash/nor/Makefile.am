@@ -73,6 +73,21 @@ NOR_DRIVERS = \
 	%D%/str9x.c \
 	%D%/str9xpec.c \
 	%D%/swm050.c \
+	%D%/hm3061m_info.c \
+	%D%/hm3065_info.c \
+	%D%/hm3066_main.c\
+	%D%/hm3066_info.c\
+	%D%/flash_offline_load.c\
+	%D%/ws63.c\
+	%D%/hi3071_main.c\
+	%D%/hi3066h_main.c\
+	%D%/hi3066h_info.c\
+	%D%/nb.c\
+	%D%/hm128.c \
+	%D%/hm64.c \
+	%D%/hm160.c \
+	%D%/au160.c \
+	%D%/au80.c \
 	%D%/tms470.c \
 	%D%/virtual.c \
 	%D%/w600.c \
@@ -94,4 +109,5 @@ NORHEADERS = \
 	%D%/spi.h \
 	%D%/stm32l4x.h \
 	%D%/stmqspi.h \
-	%D%/msp432.h
+	%D%/msp432.h \
+	%D%/flash_offline_load.h 

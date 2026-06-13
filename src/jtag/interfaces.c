@@ -37,6 +37,9 @@ extern struct adapter_driver parport_adapter_driver;
 #if BUILD_DUMMY == 1
 extern struct adapter_driver dummy_adapter_driver;
 #endif
+#if BUILD_FT2232_FTD2XX == 1
+extern struct adapter_driver ft2232_adapter_driver;
+#endif
 #if BUILD_FTDI == 1
 extern struct adapter_driver ftdi_adapter_driver;
 #endif
@@ -156,6 +159,9 @@ struct adapter_driver *adapter_drivers[] = {
 #endif
 #if BUILD_DUMMY == 1
 		&dummy_adapter_driver,
+#endif
+#if BUILD_FT2232_FTD2XX == 1
+		&ft2232_adapter_driver,
 #endif
 #if BUILD_FTDI == 1
 		&ftdi_adapter_driver,

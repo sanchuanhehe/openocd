@@ -11,19 +11,11 @@
 
 #include <stdlib.h>
 #include <stdint.h>
-#include "target/arm_adi_v5.h"
 #include "target/arm_cti.h"
 #include "target/target.h"
 #include "helper/time_support.h"
 #include "helper/list.h"
 #include "helper/command.h"
-
-struct arm_cti {
-	struct list_head lh;
-	char *name;
-	struct adiv5_mem_ap_spot spot;
-	struct adiv5_ap *ap;
-};
 
 static LIST_HEAD(all_cti);
 
@@ -469,7 +461,7 @@ static int cti_create(struct jim_getopt_info *goi)
 		return JIM_ERR;
 
 	adiv5_mem_ap_spot_init(&cti->spot);
-
+	cti->spot.ap_num = 0;
 	/* Do the rest as "configure" options */
 	goi->isconfigure = 1;
 	e = cti_configure(goi, cti);

@@ -414,7 +414,11 @@ static int adi_jtag_scan_inout_check_u32(struct adiv5_dap *dap,
 			return retval;
 	}
 
-	return jtag_execute_queue();
+	jtag_execute_queue_noclear();
+
+	jtag_error_clear();
+
+	return ERROR_OK;
 }
 
 static int jtagdp_overrun_check(struct adiv5_dap *dap)
@@ -443,7 +447,9 @@ static int jtagdp_overrun_check(struct adiv5_dap *dap)
 			found_wait = 1;
 			break;
 		} else {
+#ifndef HISPARK_TRACE_MODIFIES
 			LOG_ERROR("Invalid ACK (%1x) in DAP response", el->ack);
+#endif /* HISPARK_TRACE_MODIFIES */
 			log_dap_cmd(dap, "ERR", el);
 			retval = ERROR_JTAG_DEVICE_ERROR;
 			goto done;
@@ -633,6 +639,9 @@ static int jtagdp_transaction_endcheck(struct adiv5_dap *dap)
 {
 	int retval;
 	uint32_t ctrlstat, pwrmask;
+#ifdef HISPARK_TRACE_MODIFIES
+	extern unsigned int g_readBufFlag;
+#endif /* HISPARK_TRACE_MODIFIES */
 
 	/* too expensive to call keep_alive() here */
 
@@ -654,12 +663,25 @@ static int jtagdp_transaction_endcheck(struct adiv5_dap *dap)
 		if (!dap->ignore_syspwrupack)
 			pwrmask |= CSYSPWRUPACK;
 		if ((ctrlstat & pwrmask) != pwrmask) {
+#ifdef HISPARK_TRACE_MODIFIES
+			if (g_readBufFlag == 0) {
+				LOG_ERROR("Debug regions are unpowered, an unexpected reset might have happened");
+			}
+#else /* HISPARK_TRACE_MODIFIES */
 			LOG_ERROR("Debug regions are unpowered, an unexpected reset might have happened");
+#endif /* HISPARK_TRACE_MODIFIES */
 			dap->do_reconnect = true;
 		}
 
-		if (ctrlstat & SSTICKYERR)
-			LOG_ERROR("JTAG-DP STICKY ERROR");
+		if (ctrlstat & SSTICKYERR) {
+#ifdef HISPARK_TRACE_MODIFIES
+			if (g_readBufFlag == 0) {
+				LOG_WARNING("JTAG-DP STICKY ERROR detected, attempting to clear");
+			}
+#else /* HISPARK_TRACE_MODIFIES */
+			LOG_WARNING("JTAG-DP STICKY ERROR detected, attempting to clear");
+#endif /* HISPARK_TRACE_MODIFIES */
+		}
 		if (ctrlstat & SSTICKYORUN)
 			LOG_DEBUG("JTAG-DP STICKY OVERRUN");
 
@@ -670,7 +692,33 @@ static int jtagdp_transaction_endcheck(struct adiv5_dap *dap)
 		if (retval != ERROR_OK)
 			goto done;
 
-		retval = ERROR_JTAG_DEVICE_ERROR;
+		/* Add delay to allow DAP to stabilize after clearing sticky errors */
+		alive_sleep(100);
+
+		/* Read CTRL/STAT again to verify sticky errors are cleared */
+		retval = adi_jtag_scan_inout_check_u32(dap, JTAG_DP_DPACC,
+				DP_CTRL_STAT, DPAP_READ, 0, &ctrlstat, 0);
+		if (retval != ERROR_OK)
+			goto done;
+
+		/* Check if sticky errors persist */
+		if (ctrlstat & (SSTICKYERR | SSTICKYORUN)) {
+#ifdef HISPARK_TRACE_MODIFIES
+			if (g_readBufFlag == 0) {
+				LOG_ERROR("JTAG-DP STICKY ERROR persist after clear");
+			}
+#else /* HISPARK_TRACE_MODIFIES */
+			LOG_ERROR("JTAG-DP STICKY ERROR persist after clear");
+#endif /* HISPARK_TRACE_MODIFIES */
+			retval = ERROR_JTAG_DEVICE_ERROR;
+		} else {
+#ifdef HISPARK_TRACE_MODIFIES
+			if (g_readBufFlag == 0) {
+				LOG_DEBUG("JTAG-DP sticky errors cleared successfully");
+			}
+#endif /* HISPARK_TRACE_MODIFIES */
+			retval = ERROR_OK;
+		}
 	}
 
  done:
@@ -683,7 +731,23 @@ static int jtagdp_transaction_endcheck(struct adiv5_dap *dap)
 static int jtag_connect(struct adiv5_dap *dap)
 {
 	dap->do_reconnect = false;
+
+#ifdef HISPARK_TRACE_MODIFIES
+	int status;
+
+	status = dap_dp_init(dap);
+	if (status == ERROR_OK) {
+		return status;
+	} else {
+		jtag_initAgain();
+		dap_send_sequence(dap, SWD_TO_JTAG);
+		status = dap_dp_init(dap);
+	}
+
+	return status;
+#else /* HISPARK_TRACE_MODIFIES */
 	return dap_dp_init(dap);
+#endif /* HISPARK_TRACE_MODIFIES */
 }
 
 static int jtag_check_reconnect(struct adiv5_dap *dap)

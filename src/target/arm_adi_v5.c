@@ -95,8 +95,7 @@ static int mem_ap_setup_csw(struct adiv5_ap *ap, uint32_t csw)
 	csw |= ap->csw_default;
 
 	if (csw != ap->csw_value) {
-		/* LOG_DEBUG("DAP: Set CSW %x",csw); */
-		int retval = dap_queue_ap_write(ap, MEM_AP_REG_CSW(ap->dap), csw);
+		int retval = dap_queue_ap_write(ap, ADIV5_MEM_AP_REG_CSW, csw);
 		if (retval != ERROR_OK) {
 			ap->csw_value = 0;
 			return retval;
@@ -461,9 +460,9 @@ static int mem_ap_write(struct adiv5_ap *ap, const uint8_t *buffer, uint32_t siz
 	if (retval != ERROR_OK) {
 		target_addr_t tar;
 		if (mem_ap_read_tar(ap, &tar) == ERROR_OK)
-			LOG_ERROR("Failed to write memory at " TARGET_ADDR_FMT, tar);
+			LOG_INFO("Failed to write memory at " TARGET_ADDR_FMT, tar);
 		else
-			LOG_ERROR("Failed to write memory and, additionally, failed to find out where");
+			LOG_INFO("Failed to write memory and, additionally, failed to find out where");
 	}
 
 	return retval;
@@ -696,16 +695,23 @@ int dap_dp_init(struct adiv5_dap *dap)
 	 * both jtag and swd modes, if not done before.
 	 */
 	retval = dap_queue_dp_write(dap, DP_CTRL_STAT, dap->dp_ctrl_stat | SSTICKYERR);
-	if (retval != ERROR_OK)
+	if (retval != ERROR_OK) {
+		LOG_ERROR("dap_queue_dp_write DP_CTRL_STAT (dap->dp_ctrl_stat | SSTICKYERR:%ld) FAIL", 
+		dap->dp_ctrl_stat | SSTICKYERR);
 		return retval;
+	}
 
 	retval = dap_queue_dp_read(dap, DP_CTRL_STAT, NULL);
-	if (retval != ERROR_OK)
+	if (retval != ERROR_OK) {
+		LOG_ERROR("dap_queue_dp_read DP_CTRL_STAT FAIL");
 		return retval;
+	}
 
 	retval = dap_queue_dp_write(dap, DP_CTRL_STAT, dap->dp_ctrl_stat);
-	if (retval != ERROR_OK)
+	if (retval != ERROR_OK) {
+		LOG_ERROR("dap_queue_dp_write DP_CTRL_STAT (dap->dp_ctrl_stat:%d) FAIL", dap->dp_ctrl_stat);
 		return retval;
+	}
 
 	/* Check that we have debug power domains activated */
 	LOG_DEBUG("DAP: wait CDBGPWRUPACK");
@@ -1046,6 +1052,107 @@ int dap_find_get_ap(struct adiv5_dap *dap, enum ap_type type_to_find, struct adi
 	}
 
 	LOG_DEBUG("No %s found", ap_type_to_description(type_to_find));
+	return ERROR_FAIL;
+}
+
+int dap_find_ap(struct adiv5_dap *dap, enum ap_type type_to_find, struct adiv5_ap **ap_out)
+{
+	int ap_num;
+
+	/* Maximum AP number is 255 since the SELECT register is 8 bits */
+	for (ap_num = 0; ap_num <= DP_APSEL_MAX; ap_num++) {
+		/* read the IDR register of the Access Port */
+		uint32_t id_val = 0;
+
+		int retval = dap_queue_ap_read(dap_get_ap(dap, ap_num), ADIV5_AP_REG_IDR, &id_val);
+		if (retval != ERROR_OK)
+			return retval;
+
+		retval = dap_run(dap);
+
+		/* IDR bits:
+		 * 31-28 : Revision
+		 * 27-24 : JEDEC bank (0x4 for ARM)
+		 * 23-17 : JEDEC code (0x3B for ARM)
+		 * 16-13 : Class (0b1000=Mem-AP)
+		 * 12-8  : Reserved
+		 *  7-4  : AP Variant (non-zero for JTAG-AP)
+		 *  3-0  : AP Type (0=JTAG-AP 1=AHB-AP 2=APB-AP 4=AXI-AP)
+		 */
+
+		/* Reading register for a non-existent AP should not cause an error,
+		 * but just to be sure, try to continue searching if an error does happen.
+		 */
+		// when use ARM-BUSJTAG, JEDEC code is 0x38 rather than 0x3B
+		// so here change 0xffe0000->0xff00000, 0x4760000->0x04700000
+		if ((retval == ERROR_OK) &&                  /* Register read success */
+			((id_val & 0x0ff00000) == 0x04700000) && /* Jedec codes match */
+			((id_val & IDR_TYPE) == 2)) {      /* type matches*/
+
+			LOG_DEBUG("Found %s at AP index: %d (IDR=0x%08" PRIX32 ")",
+						(type_to_find == AP_TYPE_AHB3_AP)  ? "AHB3-AP"  :
+						(type_to_find == AP_TYPE_AHB5_AP)  ? "AHB5-AP"  :
+						(type_to_find == AP_TYPE_APB_AP)  ? "APB-AP"  :
+						(type_to_find == AP_TYPE_AXI_AP)  ? "AXI-AP"  :
+						(type_to_find == AP_TYPE_JTAG_AP) ? "JTAG-AP" : "Unknown",
+						ap_num, id_val);
+
+			*ap_out = &dap->ap[ap_num];
+			return ERROR_OK;
+		}
+	}
+
+	LOG_DEBUG("No %s found",
+				(type_to_find == AP_TYPE_AHB3_AP)  ? "AHB3-AP"  :
+				(type_to_find == AP_TYPE_AHB5_AP)  ? "AHB5-AP"  :
+				(type_to_find == AP_TYPE_APB_AP)  ? "APB-AP"  :
+				(type_to_find == AP_TYPE_AXI_AP)  ? "AXI-AP"  :
+				(type_to_find == AP_TYPE_JTAG_AP) ? "JTAG-AP" : "Unknown");
+	return ERROR_FAIL;
+}
+
+int dap_find_ap_num(struct adiv5_dap *dap, enum ap_type type_to_find, struct adiv5_ap **ap_out, int ap_num)
+{
+	/* read the IDR register of the Access Port */
+	uint32_t id_val = 0;
+
+	int retval = dap_queue_ap_read(dap_get_ap(dap, ap_num), ADIV5_AP_REG_IDR, &id_val);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = dap_run(dap);
+
+	/* IDR bits:
+	* 31-28 : Revision
+	* 27-24 : JEDEC bank (0x4 for ARM)
+	* 23-17 : JEDEC code (0x3B for ARM)
+	* 16-13 : Class (0b1000=Mem-AP)
+	* 12-8  : Reserved
+	*  7-4  : AP Variant (non-zero for JTAG-AP)
+	*  3-0  : AP Type (0=JTAG-AP 1=AHB-AP 2=APB-AP 4=AXI-AP)
+	*/
+
+	if ((retval == ERROR_OK) &&                  /* Register read success */
+			((id_val & 0x0ff00000) == 0x04700000) && /* Jedec codes match */
+			((id_val & IDR_TYPE) == 2)) {      /* type matches*/
+
+		LOG_DEBUG("Found %s at AP index: %d (IDR=0x%08" PRIX32 ")",
+					(type_to_find == AP_TYPE_AHB3_AP) ? "AHB3-AP" :
+					(type_to_find == AP_TYPE_AHB5_AP) ? "AHB5-AP" :
+					(type_to_find == AP_TYPE_APB_AP)  ? "APB-AP"  :
+					(type_to_find == AP_TYPE_AXI_AP)  ? "AXI-AP"  :
+					(type_to_find == AP_TYPE_JTAG_AP) ? "JTAG-AP" : "Unknown",
+						ap_num, id_val);
+		*ap_out = &dap->ap[ap_num];
+		return ERROR_OK;
+	}
+
+	LOG_ERROR("No %s found at debug_ap[%d]",
+			(type_to_find == AP_TYPE_AHB3_AP) ? "AHB3-AP" :
+			(type_to_find == AP_TYPE_AHB5_AP) ? "AHB5-AP" :
+			(type_to_find == AP_TYPE_APB_AP)  ? "APB-AP"  :
+			(type_to_find == AP_TYPE_AXI_AP)  ? "AXI-AP"  :
+			(type_to_find == AP_TYPE_JTAG_AP) ? "JTAG-AP" : "Unknown", ap_num);
 	return ERROR_FAIL;
 }
 
@@ -2768,6 +2875,158 @@ COMMAND_HANDLER(dap_dpreg_command)
 	return retval;
 }
 
+#ifdef HISPARK_TRACE_MODIFIES
+COMMAND_HANDLER(dap_readap_command)
+{
+	struct adiv5_dap *dap = adiv5_get_dap(CMD_DATA);
+	uint32_t apsel, reg, value;
+	struct adiv5_ap *ap;
+	int retval;
+
+	if (CMD_ARGC != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	// COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], apsel);
+	/* select ap_num to 1 */
+	apsel = 1;
+	/* AP address is in bits 31:24 of DP_SELECT */
+	// if (apsel > DP_APSEL_MAX) {
+	// 	command_print(CMD, "Invalid AP number");
+	// 	return ERROR_COMMAND_ARGUMENT_INVALID;
+	// }
+
+	ap = dap_get_ap(dap, apsel);
+
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], reg);
+	reg *= 4;
+	if (reg >= 256 || (reg & 3)) {
+		command_print(CMD, "Invalid reg value (should be less than 256 and 4 bytes aligned)");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+
+	retval = dap_queue_ap_read(ap, reg, &value);
+	if (retval == ERROR_OK)
+		retval = dap_run(dap);
+
+	if (retval != ERROR_OK)
+		return retval;
+
+	command_print(CMD, "0x%08" PRIx32, value);
+
+	return retval;
+}
+
+COMMAND_HANDLER(dap_writeap_command)
+{
+	struct adiv5_dap *dap = adiv5_get_dap(CMD_DATA);
+	uint32_t apsel, reg, value;
+	struct adiv5_ap *ap;
+	int retval;
+
+	if (CMD_ARGC != 2)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	// COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], apsel);
+	/* select ap_num to 1 */
+	apsel = 1;
+	/* AP address is in bits 31:24 of DP_SELECT */
+	// if (apsel > DP_APSEL_MAX) {
+	// 	command_print(CMD, "Invalid AP number");
+	// 	return ERROR_COMMAND_ARGUMENT_INVALID;
+	// }
+
+	ap = dap_get_ap(dap, apsel);
+
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], reg);
+	reg *= 4;
+	if (reg >= 256 || (reg & 3)) {
+		command_print(CMD, "Invalid reg value (should be less than 256 and 4 bytes aligned)");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], value);
+	switch (reg) {
+	case ADIV5_MEM_AP_REG_CSW:
+		ap->csw_value = 0;  /* invalid, in case write fails */
+		retval = dap_queue_ap_write(ap, reg, value);
+		if (retval == ERROR_OK)
+			ap->csw_value = value;
+		break;
+	case ADIV5_MEM_AP_REG_TAR:
+		ap->tar_valid = false;  /* invalid, force write */
+		retval = mem_ap_setup_tar(ap, value);
+		break;
+	default:
+		retval = dap_queue_ap_write(ap, reg, value);
+		break;
+	}
+	
+	if (retval == ERROR_OK)
+		retval = dap_run(dap);
+
+	if (retval != ERROR_OK)
+		return retval;
+
+	return retval;
+}
+
+COMMAND_HANDLER(dap_readdp_command)
+{
+	struct adiv5_dap *dap = adiv5_get_dap(CMD_DATA);
+	uint32_t reg, value;
+	int retval;
+
+	if (CMD_ARGC != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], reg);
+	reg *= 4;
+	if (reg >= 256 || (reg & 3)) {
+		command_print(CMD, "Invalid reg value (should be less than 256 and 4 bytes aligned)");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+
+	retval = dap_queue_dp_read(dap, reg, &value);
+	if (retval == ERROR_OK)
+		retval = dap_run(dap);
+
+	if (retval != ERROR_OK)
+		return retval;
+
+	command_print(CMD, "0x%08" PRIx32, value);
+
+	return retval;
+}
+
+COMMAND_HANDLER(dap_writedp_command)
+{
+	struct adiv5_dap *dap = adiv5_get_dap(CMD_DATA);
+	uint32_t reg, value;
+	int retval;
+
+	if (CMD_ARGC != 2)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], reg);
+	reg *= 4;
+	if (reg >= 256 || (reg & 3)) {
+		command_print(CMD, "Invalid reg value (should be less than 256 and 4 bytes aligned)");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], value);
+	retval = dap_queue_dp_write(dap, reg, value);
+	if (retval == ERROR_OK)
+		retval = dap_run(dap);
+
+	if (retval != ERROR_OK)
+		return retval;
+
+	return retval;
+}
+#endif /* HISPARK_TRACE_MODIFIES */
+
+
 COMMAND_HANDLER(dap_ti_be_32_quirks_command)
 {
 	struct adiv5_dap *dap = adiv5_get_dap(CMD_DATA);
@@ -2831,6 +3090,40 @@ const struct command_registration dap_instance_commands[] = {
 			"(reg is byte address (bank << 4 | reg) of a word register, like 0 4 8...)",
 		.usage = "reg [value]",
 	},
+#ifdef HISPARK_TRACE_MODIFIES
+	{
+		.name = "ReadAP",
+		.handler = dap_readap_command,
+		.mode = COMMAND_EXEC,
+		.help = "read/write a register from AP "
+			"(reg is byte address of a word register, like 0 1 2...)",
+		.usage = "reg",
+	},
+	{
+		.name = "WriteAP",
+		.handler = dap_writeap_command,
+		.mode = COMMAND_EXEC,
+		.help = "read/write a register from AP "
+			"(reg is byte address of a word register, like 0 1 2...)",
+		.usage = "reg value",
+	},
+	{
+		.name = "ReadDP",
+		.handler = dap_readdp_command,
+		.mode = COMMAND_EXEC,
+		.help = "read/write a register from DP "
+			"(reg is byte address (bank << 4 | reg) of a word register, like 0 1 2...)",
+		.usage = "reg",
+	},
+	{
+		.name = "WriteDP",
+		.handler = dap_writedp_command,
+		.mode = COMMAND_EXEC,
+		.help = "read/write a register from DP "
+			"(reg is byte address (bank << 4 | reg) of a word register, like 0 1 2...)",
+		.usage = "reg value",
+	},
+#endif /* HISPARK_TRACE_MODIFIES */	
 	{
 		.name = "baseaddr",
 		.handler = dap_baseaddr_command,

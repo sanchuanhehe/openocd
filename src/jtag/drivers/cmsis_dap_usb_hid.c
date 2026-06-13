@@ -37,7 +37,8 @@ struct cmsis_dap_backend_data {
 static void cmsis_dap_hid_close(struct cmsis_dap *dap);
 static int cmsis_dap_hid_alloc(struct cmsis_dap *dap, unsigned int pkt_sz);
 
-static int cmsis_dap_hid_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t pids[], const char *serial)
+static int cmsis_dap_hid_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t pids[], const char *serial,
+    char *usbDeviceName)
 {
 	hid_device *dev = NULL;
 	int i;

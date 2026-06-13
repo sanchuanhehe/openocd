@@ -68,6 +68,9 @@ endif
 if DUMMY
 DRIVERFILES += %D%/dummy.c
 endif
+if FT2232_DRIVER
+DRIVERFILES += %D%/ft2232.c
+endif
 if FTDI
 DRIVERFILES += %D%/ftdi.c %D%/mpsse.c
 endif
@@ -210,4 +213,5 @@ DRIVERHEADERS = \
 	%D%/versaloon/usbtoxxx/usbtoxxx_internal.h \
 	%D%/versaloon/versaloon.h \
 	%D%/versaloon/versaloon_include.h \
-	%D%/versaloon/versaloon_internal.h
+	%D%/versaloon/versaloon_internal.h\
+	%D%/ftd2xx_common.h

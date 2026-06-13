@@ -5,6 +5,8 @@
  *                                                                         *
  ***************************************************************************/
 
+#include "target/arm_adi_v5.h"
+
 #ifndef OPENOCD_TARGET_ARM_CTI_H
 #define OPENOCD_TARGET_ARM_CTI_H
 
@@ -47,7 +49,14 @@
 #define CTI_TRIG(n)			(1 << CTI_TRIG_##n)
 
 /* forward-declare arm_cti struct */
-struct arm_cti;
+//struct arm_cti;
+struct arm_cti {
+        struct list_head lh;
+        char *name;
+        struct adiv5_mem_ap_spot spot;
+        struct adiv5_ap *ap;
+};
+
 struct adiv5_ap;
 
 extern const char *arm_cti_name(struct arm_cti *self);

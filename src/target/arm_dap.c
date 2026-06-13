@@ -18,6 +18,9 @@
 #include "transport/transport.h"
 #include "jtag/interface.h"
 
+unsigned int g_swdInitFlag = 0;
+unsigned int g_swdInitLogCount;
+
 static LIST_HEAD(all_dap);
 
 extern const struct dap_ops swd_dap_ops;
@@ -93,6 +96,7 @@ static int dap_init_all(void)
 {
 	struct arm_dap_object *obj;
 	int retval;
+	int initLoop = 0;
 
 	LOG_DEBUG("Initializing all DAPs ...");
 
@@ -125,8 +129,25 @@ static int dap_init_all(void)
 				is_adiv6(dap) ? "ADIv6" : "ADIv5");
 		}
 
-		retval = dap->ops->connect(dap);
+
+		if (transport_is_swd()) {
+			LOG_DEBUG("30 cycles(15s) to connect dap,close the LOG(ft2232_swd_switch_seq(): JTAG-to-SWD)");
+			/* control the number of log */
+			g_swdInitFlag = 1;
+			for (initLoop = 0; initLoop < 30; initLoop++){
+				g_swdInitLogCount = initLoop;
+				retval = dap->ops->connect(dap);
+				if (retval == ERROR_OK) {
+					g_swdInitFlag = 0;
+					g_swdInitLogCount = 0;
+					break;
+				}
+			}
+			LOG_DEBUG("30 cycles(15s) End at [%d]",initLoop);
+		} else
+			retval = dap->ops->connect(dap);			
 		if (retval != ERROR_OK)
+			LOG_INFO("dap init failed");
 			return retval;
 
 		/* see if address size of ROM Table is greater than 32-bits */

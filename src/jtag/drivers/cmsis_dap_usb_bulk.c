@@ -39,13 +39,109 @@ struct cmsis_dap_backend_data {
 	int interface;
 };
 
+static int const USB_NUM_MAX = 8;
+static int const USB_VID = 0x1234;
+static int const USB_PID = 0x5678;
+
 static int cmsis_dap_usb_interface = -1;
+static int g_usbNumValues[8] = {-1, 0, 0, 0, 0, 0, 0, 0}; // 8 usb num max
+static int g_usbNum = 0;
 
 static void cmsis_dap_usb_close(struct cmsis_dap *dap);
 static int cmsis_dap_usb_alloc(struct cmsis_dap *dap, unsigned int pkt_sz);
 
-static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t pids[], const char *serial)
+static void SetUsbNumValues(char *usbDeviceName)
 {
+	if (usbDeviceName) {
+		// use underscores (_) to separate character strings and store them in arrays.
+        char *usbNum;
+        usbNum = strtok(usbDeviceName, "_");
+        LOG_DEBUG("usbNum: %s", usbNum);
+        while (usbNum != NULL && g_usbNum < USB_NUM_MAX) {
+            g_usbNumValues[g_usbNum++] = atoi(usbNum);
+            usbNum = strtok(NULL, "_");
+            LOG_DEBUG("usbNum: %s", usbNum);
+        }
+	}
+}
+
+static bool IsCurDevice(struct libusb_device *dev)
+{
+    uint8_t path[8] = {0}; // 8 usb num max
+	int portNum = libusb_get_port_numbers(dev, path, sizeof(path));
+	if (portNum != g_usbNum) {
+	    LOG_DEBUG("usb num not same, usbNum: %d, port: %d", g_usbNum, portNum);
+        return false;
+	}
+
+	LOG_DEBUG("usb port start");
+    for (int j = 0; j < portNum; j++) {
+	    LOG_DEBUG("port %d", path[j]);
+	}
+	LOG_DEBUG("usb port end");
+
+    for (int i = 0; i < portNum; i++) {
+		LOG_DEBUG("usbNumValue %d, path: %d", g_usbNumValues[i], path[i]);
+		if (g_usbNumValues[i] != path[i]) {
+		    LOG_DEBUG("index %d usb num not same, usbNumValue %d, path: %d", i, g_usbNumValues[i], path[i]);
+            return false;
+		}
+	}
+	return true;
+}
+
+static void PrintUsbPortNum(uint16_t vids[], uint16_t pids[])
+{
+	int err;
+	struct libusb_context *ctx;
+	struct libusb_device **device_list;
+	err = libusb_init(&ctx);
+	if (err) {
+		LOG_ERROR("libusb initialization failed: %s", libusb_strerror(err));
+		return ERROR_FAIL;
+	}
+
+	int num_devices = libusb_get_device_list(ctx, &device_list);
+	if (num_devices < 0) {
+		LOG_ERROR("could not enumerate USB devices: %s", libusb_strerror(num_devices));
+		libusb_exit(ctx);
+		return ERROR_FAIL;
+	}
+
+	for (int i = 0; i < num_devices; i++) {
+		struct libusb_device *dev = device_list[i];
+		struct libusb_device_descriptor dev_desc;
+
+		err = libusb_get_device_descriptor(dev, &dev_desc);
+		if (err) {
+			LOG_ERROR("could not get device descriptor for device %d: %s", i, libusb_strerror(err));
+			continue;
+		}
+
+        if ((dev_desc.idVendor != USB_VID) && (dev_desc.idProduct != USB_PID)) {
+			continue;
+		}
+
+		uint8_t path[8] = {0}; // 8 usb num max
+	    int portNum = libusb_get_port_numbers(dev, path, sizeof(path));
+	    LOG_INFO("usb %d port start", i);
+        for (int j = 0; j < portNum; j++) {
+	        LOG_INFO("port %d", path[j]);
+	    }
+	    LOG_INFO("usb %d port end", i);
+	}
+	return ERROR_OK;
+}
+
+static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t pids[], const char *serial,
+    char *usbDeviceName)
+{
+	SetUsbNumValues(usbDeviceName);
+	if (g_usbNumValues[0] == 0) {
+        PrintUsbPortNum(vids, pids);
+		return ERROR_FAIL;
+	}
+
 	int err;
 	struct libusb_context *ctx;
 	struct libusb_device **device_list;
@@ -91,6 +187,10 @@ static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t p
 		/* Don't continue if we asked for a serial number and the device doesn't have one */
 		if (dev_desc.iSerialNumber == 0 && serial && serial[0])
 			continue;
+
+		if ((g_usbNumValues[0] > 0) && !IsCurDevice(dev)) {
+			continue;
+		}
 
 		struct libusb_device_handle *dev_handle = NULL;
 		err = libusb_open(dev, &dev_handle);
@@ -340,8 +440,18 @@ static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t p
 			}
 
 			err = libusb_claim_interface(dev_handle, interface_num);
-			if (err)
+			if (err) {
 				LOG_WARNING("could not claim interface: %s", libusb_strerror(err));
+				err = libusb_detach_kernel_driver(dev_handle, interface_num);
+				if (err) {
+				    LOG_WARNING("could not detach libusb_detach_kernel_driver: %s", libusb_strerror(err));
+				    err = libusb_claim_interface(dev_handle, interface_num);
+				    if (err) {
+						LOG_ERROR("could not claim interface: %s", libusb_strerror(err));
+					    return ERROR_FAIL;
+					}
+				}
+			}
 
 			dap->bdata = malloc(sizeof(struct cmsis_dap_backend_data));
 			if (!dap->bdata) {

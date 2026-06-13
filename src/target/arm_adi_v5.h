@@ -156,6 +156,9 @@
 #define ADIV6_AP_REG_IDR        (0xD00 + ADIV5_AP_REG_IDR)
 #define AP_REG_IDR(dap)         (is_adiv6(dap) ? ADIV6_AP_REG_IDR : ADIV5_AP_REG_IDR)
 
+/* Fields of the MEM-AP's IDR register */
+#define IDR_TYPE    (0xFUL << 0)
+
 /* Fields of the MEM-AP's CSW register */
 #define CSW_SIZE_MASK		7
 #define CSW_8BIT		0
@@ -225,6 +228,9 @@
 
 #define AP_TYPE_MASK (AP_REG_IDR_DESIGNER_MASK | AP_REG_IDR_CLASS_MASK | AP_REG_IDR_TYPE_MASK)
 
+#ifdef HISPARK_TRACE_MODIFIES
+#define SWDINITCOUNT 30
+#endif /* HISPARK_TRACE_MODIFIES */
 /* FIXME: not SWD specific; should be renamed, e.g. adiv5_special_seq */
 enum swd_special_seq {
 	LINE_RESET,
@@ -698,6 +704,15 @@ bool is_ap_num_valid(struct adiv5_dap *dap, uint64_t ap_num);
 int dap_find_get_ap(struct adiv5_dap *dap,
 			enum ap_type type_to_find,
 			struct adiv5_ap **ap_out);
+
+int dap_find_ap(struct adiv5_dap *dap,
+			enum ap_type type_to_find,
+			struct adiv5_ap **ap_out);
+/* AP_TYPE_APB_AP, treat RISCV-Core as the CoreSight-APB */
+int dap_find_ap_num(struct adiv5_dap *dap,
+					enum ap_type type_to_find, 
+					struct adiv5_ap **ap_out,
+					int ap_num);
 
 /* Return AP with specified ap_num. Increment AP refcount */
 struct adiv5_ap *dap_get_ap(struct adiv5_dap *dap, uint64_t ap_num);

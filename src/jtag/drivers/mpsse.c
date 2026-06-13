@@ -51,6 +51,11 @@
 #define SIO_RESET_PURGE_RX 1
 #define SIO_RESET_PURGE_TX 2
 
+#ifndef HISPARK_TRACE_MODIFIES
+extern uint16_t jtag_output_init;
+extern uint16_t jtag_direction_init;
+#endif /* HISPARK_TRACE_MODIFIES */
+
 struct mpsse_ctx {
 	struct libusb_context *usb_ctx;
 	struct libusb_device_handle *usb_dev;
@@ -180,7 +185,23 @@ static bool open_matching_device(struct mpsse_ctx *ctx, const uint16_t *vid, con
 				  libusb_error_name(err));
 			continue;
 		}
+		/* Try to detach ftdi_sio kernel module */
+		err = libusb_detach_kernel_driver(ctx->usb_dev, ctx->interface);
+		if (err != LIBUSB_SUCCESS && err != LIBUSB_ERROR_NOT_FOUND
+				&& err != LIBUSB_ERROR_NOT_SUPPORTED) {
+			LOG_WARNING("libusb_detach_kernel_driver() failed with %s, trying to continue anyway",
+				libusb_error_name(err));
+			libusb_close(ctx->usb_dev);
+			continue;
+		}
 
+		err = libusb_claim_interface(ctx->usb_dev, ctx->interface);
+		if (err != LIBUSB_SUCCESS) {
+			LOG_ERROR("libusb_claim_interface() failed with %s", libusb_error_name(err));
+			libusb_close(ctx->usb_dev);
+			continue;
+		}
+		
 		if (location && !device_location_equal(device, location)) {
 			libusb_close(ctx->usb_dev);
 			continue;
@@ -204,12 +225,28 @@ static bool open_matching_device(struct mpsse_ctx *ctx, const uint16_t *vid, con
 
 	if (!found) {
 		LOG_ERROR("no device found");
+		libusb_release_interface(ctx->usb_dev, ctx->interface);
+		libusb_close(ctx->usb_dev);
+#ifdef HISPARK_TRACE_MODIFIES
+		LOG_ERROR("*********************************************************************************************************\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       * Connecting to HiSpark-Link/FT2232H Debugger failed. Please check:                                     *\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       * 1.Debugger's Settings, such as the Tool name, JTAG/SWD interface and speed                            *\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       * 2.Debugger is connected to PC by USB cable                                                            *\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       * 3.All other Debugging and Variable Trace services have been shutdown                                  *\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       *********************************************************************************************************");
+#endif /* HISPARK_TRACE_MODIFIES */
 		return false;
 	}
 
 	err = libusb_get_config_descriptor(libusb_get_device(ctx->usb_dev), 0, &config0);
 	if (err != LIBUSB_SUCCESS) {
 		LOG_ERROR("libusb_get_config_descriptor() failed with %s", libusb_error_name(err));
+		libusb_release_interface(ctx->usb_dev, ctx->interface);
 		libusb_close(ctx->usb_dev);
 		return false;
 	}
@@ -228,20 +265,6 @@ static bool open_matching_device(struct mpsse_ctx *ctx, const uint16_t *vid, con
 			LOG_ERROR("libusb_set_configuration() failed with %s", libusb_error_name(err));
 			goto error;
 		}
-	}
-
-	/* Try to detach ftdi_sio kernel module */
-	err = libusb_detach_kernel_driver(ctx->usb_dev, ctx->interface);
-	if (err != LIBUSB_SUCCESS && err != LIBUSB_ERROR_NOT_FOUND
-			&& err != LIBUSB_ERROR_NOT_SUPPORTED) {
-		LOG_WARNING("libusb_detach_kernel_driver() failed with %s, trying to continue anyway",
-			libusb_error_name(err));
-	}
-
-	err = libusb_claim_interface(ctx->usb_dev, ctx->interface);
-	if (err != LIBUSB_SUCCESS) {
-		LOG_ERROR("libusb_claim_interface() failed with %s", libusb_error_name(err));
-		goto error;
 	}
 
 	/* Reset FTDI device */
@@ -303,6 +326,7 @@ desc_error:
 	LOG_ERROR("unrecognized USB device descriptor");
 error:
 	libusb_free_config_descriptor(config0);
+	libusb_release_interface(ctx->usb_dev, ctx->interface);
 	libusb_close(ctx->usb_dev);
 	return false;
 }
@@ -389,8 +413,19 @@ error:
 
 void mpsse_close(struct mpsse_ctx *ctx)
 {
-	if (ctx->usb_dev)
+	/* Reset FTDI device */
+	libusb_control_transfer(ctx->usb_dev, FTDI_DEVICE_OUT_REQTYPE,
+			SIO_SET_BITMODE_REQUEST, SIO_RESET_SIO,
+			ctx->index, NULL, 0, ctx->usb_write_timeout);
+	libusb_control_transfer(ctx->usb_dev, FTDI_DEVICE_OUT_REQTYPE,
+			SIO_RESET_REQUEST, SIO_RESET_SIO,
+			ctx->index, NULL, 0, ctx->usb_write_timeout);
+			
+	if (ctx->usb_dev) {
+		libusb_release_interface(ctx->usb_dev, ctx->interface);
 		libusb_close(ctx->usb_dev);
+	}
+		
 	if (ctx->usb_ctx)
 		libusb_exit(ctx->usb_ctx);
 	bit_copy_discard(&ctx->read_queue);
@@ -494,8 +529,22 @@ void mpsse_clock_data(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_of
 	/* TODO: On H chips, use command 0x8E/0x8F if in and out are both 0 */
 	if (out || (!out && !in))
 		mode |= 0x10;
-	if (in)
+	if (in) {
 		mode |= 0x20;
+		LOG_DEBUG_IO("mpsse_clock_data ,made");
+		if (mode & 0x1 == 1) {
+			//buffer_write_byte(ctx, 0x80);	//Command to set directions of lower 8 pins and force value on bits set as output
+			//buffer_write_byte(ctx, 0x00);
+			//buffer_write_byte(ctx, 0x09);
+			if (buffer_write_space(ctx) < 3)
+				ctx->retval = mpsse_flush(ctx);
+#ifndef HISPARK_TRACE_MODIFIES
+		 	buffer_write_byte(ctx, 0x80);     //Command to set directions of lower 8 pins and force value on bits set as output
+	        buffer_write_byte(ctx, (jtag_output_init & 0xf0));     
+	        buffer_write_byte(ctx, ((jtag_direction_init & 0xf0) | 0x9));
+#endif /* HISPARK_TRACE_MODIFIES */
+		}
+	}
 
 	while (length > 0) {
 		/* Guarantee buffer space enough for a minimum size transfer */

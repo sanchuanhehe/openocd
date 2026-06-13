@@ -82,7 +82,7 @@ static char *ftdi_device_desc;
 static uint8_t ftdi_channel;
 static uint8_t ftdi_jtag_mode = JTAG_MODE;
 
-static bool swd_mode;
+static bool swd_mode = false;
 
 #define MAX_USB_IDS 8
 /* vid = pid = 0 marks the end of the list */
@@ -104,6 +104,14 @@ struct signal {
 
 static struct signal *signals;
 
+/* Operate the LED every LED_FREQ_FACTOR times(ftdi_execute) */
+#define LED_FREQ_FACTOR 200
+typedef enum led_status {
+     LED_OFF = 0,
+     LED_ON  = 1,
+} led_status_t;
+int led_load_dump_flag = 0;
+
 /* FIXME: Where to store per-instance data? We need an SWD context. */
 static struct swd_cmd_queue_entry {
 	uint8_t cmd;
@@ -117,8 +125,8 @@ static int freq;
 
 static uint16_t output;
 static uint16_t direction;
-static uint16_t jtag_output_init;
-static uint16_t jtag_direction_init;
+uint16_t jtag_output_init;
+uint16_t jtag_direction_init;
 
 static int ftdi_swd_switch_seq(enum swd_special_seq seq);
 
@@ -628,16 +636,34 @@ static int ftdi_execute_queue(void)
 {
 	/* blink, if the current layout has that feature */
 	struct signal *led = find_signal_by_name("LED");
-	if (led)
+	static unsigned int count = 0;
+	static led_status_t old_led_status = LED_OFF;
+	led_status_t led_status = old_led_status;
+    int led_switch = 0;
+	count++;
+	if (count > LED_FREQ_FACTOR) {
+         count = 1;
+         led_switch = 1;
+    }
+
+	if (led && led_switch && old_led_status == LED_OFF && led_load_dump_flag) {
 		ftdi_set_signal(led, '1');
+		led_status = LED_ON;
+	}
 
 	for (struct jtag_command *cmd = jtag_command_queue; cmd; cmd = cmd->next) {
 		/* fill the write buffer with the desired command */
 		ftdi_execute_command(cmd);
 	}
 
-	if (led)
+	if (led && led_switch && old_led_status == LED_ON) {
 		ftdi_set_signal(led, '0');
+		led_status = LED_OFF;
+	}
+
+	if (led) {
+		old_led_status = led_status;
+	}
 
 	int retval = mpsse_flush(mpsse_ctx);
 	if (retval != ERROR_OK)
@@ -1033,7 +1059,7 @@ static int ftdi_swd_init(void)
 	if (create_signals() != ERROR_OK)
 		return ERROR_FAIL;
 
-	swd_cmd_queue_alloced = 10;
+	swd_cmd_queue_alloced = 512;
 	swd_cmd_queue = malloc(swd_cmd_queue_alloced * sizeof(*swd_cmd_queue));
 
 	return swd_cmd_queue ? ERROR_OK : ERROR_FAIL;
@@ -1043,8 +1069,14 @@ static void ftdi_swd_swdio_en(bool enable)
 {
 	struct signal *oe = find_signal_by_name("SWDIO_OE");
 	if (oe) {
-		if (oe->data_mask)
+		if (oe->data_mask) {
+#ifdef HISPARK_TRACE_MODIFIES
+			ftdi_set_signal(oe, enable ? '0' : '1');
+#else /* HISPARK_TRACE_MODIFIES */
 			ftdi_set_signal(oe, enable ? '1' : '0');
+#endif /* HISPARK_TRACE_MODIFIES */
+		}
+			
 		else {
 			/* Sets TDI/DO pin to input during rx when both pins are connected
 			   to SWDIO */
@@ -1066,7 +1098,15 @@ static int ftdi_swd_run_queue(void)
 	LOG_DEBUG_IO("Executing %zu queued transactions", swd_cmd_queue_length);
 	int retval;
 	struct signal *led = find_signal_by_name("LED");
-
+	static unsigned int count = 0;
+	static led_status_t old_led_status = LED_OFF;
+	led_status_t led_status = old_led_status;
+	int led_switch = 0;
+	count++;
+	if (count > LED_FREQ_FACTOR) {
+         count = 1;
+         led_switch = 1;
+    }
 	if (queued_retval != ERROR_OK) {
 		LOG_DEBUG_IO("Skipping due to previous errors: %d", queued_retval);
 		goto skip;
@@ -1077,8 +1117,10 @@ static int ftdi_swd_run_queue(void)
 	mpsse_clock_data_out(mpsse_ctx, NULL, 0, 8, SWD_MODE);
 
 	/* Terminate the "blink", if the current layout has that feature */
-	if (led)
-		ftdi_set_signal(led, '0');
+	if (led && led_switch && old_led_status == LED_OFF && led_load_dump_flag) {
+		ftdi_set_signal(led, '1');
+		led_status = LED_ON;
+	}
 
 	queued_retval = mpsse_flush(mpsse_ctx);
 	if (queued_retval != ERROR_OK) {
@@ -1110,7 +1152,7 @@ static int ftdi_swd_run_queue(void)
 			int parity = buf_get_u32(swd_cmd_queue[i].trn_ack_data_parity_trn, 1 + 3 + 32, 1);
 
 			if (parity != parity_u32(data)) {
-				LOG_ERROR("SWD Read data parity mismatch");
+				LOG_WARNING("SWD Read data parity mismatch");
 				queued_retval = ERROR_FAIL;
 				goto skip;
 			}
@@ -1126,8 +1168,13 @@ skip:
 	queued_retval = ERROR_OK;
 
 	/* Queue a new "blink" */
-	if (led && retval == ERROR_OK)
-		ftdi_set_signal(led, '1');
+	if (led && retval == ERROR_OK && led_switch && old_led_status == LED_ON) {
+		ftdi_set_signal(led, '0');
+		led_status = LED_OFF;
+	}
+	if (led) {
+		old_led_status = led_status;
+	}
 
 	return retval;
 }

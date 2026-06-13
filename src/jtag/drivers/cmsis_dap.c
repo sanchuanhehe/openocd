@@ -68,6 +68,11 @@ static uint16_t cmsis_dap_vid[MAX_USB_IDS + 1] = { 0 };
 static uint16_t cmsis_dap_pid[MAX_USB_IDS + 1] = { 0 };
 static int cmsis_dap_backend = -1;
 static bool swd_mode;
+#ifdef HISPARK_TRACE_MODIFIES
+int g_sendEndFlag = 1;
+int g_framingCompatibleFlag;
+#define USB_TIMEOUT       1000
+#endif /* HISPARK_TRACE_MODIFIES */
 
 /* CMSIS-DAP General Commands */
 #define CMD_DAP_INFO              0x00
@@ -118,6 +123,19 @@ static bool swd_mode;
 #define CMD_DAP_SWJ_PINS          0x10
 #define CMD_DAP_SWJ_CLOCK         0x11
 #define CMD_DAP_SWJ_SEQ           0x12
+
+#ifdef HISPARK_TRACE_MODIFIES
+#define CMD_DAP_VAR_MONITOR       0xAA
+#define CMD_DAP_READ_VAR          0xAB
+#define CMD_DAP_WRITE_VAR         0xAC
+#define CMD_DAP_STOP_VARMONITOR   0xAD
+#define CMD_DAP_PAUCE_VARMONITOR  0xAE
+#define CMD_DAP_VAR_CONFIG        0xAF
+
+#define CMD_DAP_OFFLINE_HEAD      0xB0
+#define CMD_DAP_OFFLINE_DATA      0xB1
+#define CMD_DAP_OFFLINE_STOP      0xB2
+#endif /* HISPARK_TRACE_MODIFIES */
 
 /*
  * PINS
@@ -235,6 +253,10 @@ struct pending_scan_result {
  * until the first response arrives */
 #define MAX_PENDING_REQUESTS 3
 
+#define MOVE_JTAG_STATE_CMD_LEN 3
+#define MAX_CMD_COUNT 255
+static bool m_isStm32f105;
+
 /* Pending requests are organized as a FIFO - circular buffer */
 /* Each block in FIFO can contain up to pending_queue_len transfers */
 static int pending_queue_len;
@@ -276,13 +298,15 @@ static int cmsis_dap_open(void)
 	if (cmsis_dap_backend >= 0) {
 		/* Use forced backend */
 		backend = cmsis_dap_backends[cmsis_dap_backend];
-		if (backend->open(dap, cmsis_dap_vid, cmsis_dap_pid, adapter_get_required_serial()) != ERROR_OK)
+		if (backend->open(dap, cmsis_dap_vid, cmsis_dap_pid, adapter_get_required_serial(),
+		    adapter_usb_get_location()) != ERROR_OK)
 			backend = NULL;
 	} else {
 		/* Try all backends */
 		for (unsigned int i = 0; i < ARRAY_SIZE(cmsis_dap_backends); i++) {
 			backend = cmsis_dap_backends[i];
-			if (backend->open(dap, cmsis_dap_vid, cmsis_dap_pid, adapter_get_required_serial()) == ERROR_OK)
+			if (backend->open(dap, cmsis_dap_vid, cmsis_dap_pid, adapter_get_required_serial(),
+			    adapter_usb_get_location()) == ERROR_OK)
 				break;
 			else
 				backend = NULL;
@@ -291,6 +315,19 @@ static int cmsis_dap_open(void)
 
 	if (!backend) {
 		LOG_ERROR("unable to find a matching CMSIS-DAP device");
+#ifdef HISPARK_TRACE_MODIFIES
+		LOG_ERROR("*********************************************************************************************************\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       * Connecting to HiSpark-Trace Debugger failed. Please check:                                            *\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       * 1.Debugger's Settings, such as the Tool name, JTAG/SWD interface and speed                            *\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       * 2.Debugger is connected to PC by USB cable                                                            *\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       * 3.All other Debugging and Variable Trace services have been shutdown                                  *\r\n"
+				  "       *                                                                                                       *\r\n"
+				  "       *********************************************************************************************************");
+#endif /* HISPARK_TRACE_MODIFIES */
 		free(dap);
 		return ERROR_FAIL;
 	}
@@ -374,6 +411,312 @@ static int cmsis_dap_xfer(struct cmsis_dap *dap, int txlen)
 	return ERROR_OK;
 }
 
+#ifdef HISPARK_TRACE_MODIFIES
+int cmsis_dap_cmd_DAP_Var_Config(unsigned int ahbChannelFlag)
+{
+	size_t idx = 0;
+	uint8_t *command = cmsis_dap_handle->command;
+	command[idx++] = CMD_DAP_VAR_CONFIG;
+	
+	command[idx++] = (ahbChannelFlag) & 0xff;
+	command[idx++] = (ahbChannelFlag >> 8) & 0xff;
+	command[idx++] = (ahbChannelFlag >> 16) & 0xff;
+	command[idx++] = (ahbChannelFlag >> 24) & 0xff;
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+		return ERROR_FAIL;
+	}
+	return ERROR_OK;
+}
+
+int cmsis_dap_cmd_DAP_Var_Monitor(unsigned int periodUs, unsigned int varNum, unsigned int *varAddress, unsigned int *varNumBytes)
+{
+	int retval;
+	size_t idx = 0;
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[idx++] = CMD_DAP_VAR_MONITOR;
+
+	if (varNum <= MAXVARNUM && g_sendEndFlag == 1) {
+		g_framingCompatibleFlag = 1;
+		command[idx++] = (periodUs) & 0xff;
+		command[idx++] = (periodUs >> 8) & 0xff;
+		command[idx++] = (periodUs >> 16) & 0xff;
+		command[idx++] = (periodUs >> 24) & 0xff;
+
+		command[idx++] = (varNum) & 0xff;
+		command[idx++] = (varNum >> 8) & 0xff;
+		command[idx++] = (varNum >> 16) & 0xff;
+		command[idx++] = (varNum >> 24) & 0xff;
+
+		for (unsigned int i = 0; i < varNum; i++) {
+			command[idx++] = (varAddress[i]) & 0xff;
+			command[idx++] = (varAddress[i] >> 8) & 0xff;
+			command[idx++] = (varAddress[i] >> 16) & 0xff;
+			command[idx++] = (varAddress[i] >> 24) & 0xff;
+	
+			command[idx++] = (varNumBytes[i]) & 0xff;
+			command[idx++] = (varNumBytes[i] >> 8) & 0xff;
+			command[idx++] = (varNumBytes[i] >> 16) & 0xff;
+			command[idx++] = (varNumBytes[i] >> 24) & 0xff;
+		}
+	
+		retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+		if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK)
+			return ERROR_FAIL;
+	} else {
+		int sendNum = 0;
+
+		if (g_sendEndFlag) {
+			g_sendEndFlag = 0;
+			g_framingCompatibleFlag = 0;
+			command[idx++] = (periodUs) & 0xff;
+			command[idx++] = (periodUs >> 8) & 0xff;
+			command[idx++] = (periodUs >> 16) & 0xff;
+			command[idx++] = (periodUs >> 24) & 0xff;
+
+			command[idx++] = (varNum) & 0xff;
+			command[idx++] = (varNum >> 8) & 0xff;
+			command[idx++] = (varNum >> 16) & 0xff;
+			command[idx++] = (varNum >> 24) & 0xff;
+		}
+		sendNum = varNum > MAXVARNUM ? MAXVARNUM : varNum;
+		command[idx++] = (sendNum) & 0xff;
+		command[idx++] = (sendNum >> 8) & 0xff;
+		command[idx++] = (sendNum >> 16) & 0xff;
+		command[idx++] = (sendNum >> 24) & 0xff;
+
+		for (unsigned int i = 0; i < sendNum; i++) {
+			command[idx++] = (varAddress[i]) & 0xff;
+			command[idx++] = (varAddress[i] >> 8) & 0xff;
+			command[idx++] = (varAddress[i] >> 16) & 0xff;
+			command[idx++] = (varAddress[i] >> 24) & 0xff;
+
+			command[idx++] = (varNumBytes[i]) & 0xff;
+			command[idx++] = (varNumBytes[i] >> 8) & 0xff;
+			command[idx++] = (varNumBytes[i] >> 16) & 0xff;
+			command[idx++] = (varNumBytes[i] >> 24) & 0xff;
+		}
+
+		retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+		if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK)
+			return ERROR_FAIL;
+
+		sendNum = varNum - sendNum;
+		if (sendNum) {
+			varAddress += MAXVARNUM;
+			varNumBytes += MAXVARNUM;
+			retval = cmsis_dap_cmd_DAP_Var_Monitor(periodUs, sendNum, varAddress, varNumBytes);
+			if (retval != ERROR_OK) {
+				return ERROR_FAIL;
+			}
+		}
+	}
+
+	return ERROR_OK;
+}
+
+int cmsis_dap_cmd_DAP_Read_Var(unsigned int numOfRequestedData, unsigned char *numOfResponseData, unsigned char **data)
+{
+	size_t idx = 0;
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[idx++] = CMD_DAP_READ_VAR;
+	if (g_framingCompatibleFlag == 0) {
+		command[idx++] = (numOfRequestedData) & 0xff;
+		command[idx++] = (numOfRequestedData >> 8) & 0xff;
+		command[idx++] = (numOfRequestedData >> 16) & 0xff;
+		command[idx++] = (numOfRequestedData >> 24) & 0xff;
+	}
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+	if (retval != ERROR_OK) {
+		numOfResponseData[0] = 0;
+		numOfResponseData[1] = 0;
+		numOfResponseData[2] = 0;
+		numOfResponseData[3] = 0;
+		return ERROR_FAIL;
+	}
+		
+	*data = &cmsis_dap_handle->response[5];
+	numOfResponseData[0] = cmsis_dap_handle->response[4];
+	numOfResponseData[1] = cmsis_dap_handle->response[3];
+	numOfResponseData[2] = cmsis_dap_handle->response[2];
+	numOfResponseData[3] = cmsis_dap_handle->response[1];
+	return ERROR_OK;
+}
+
+int cmsis_dap_cmd_DAP_Stop_VarMonitor(void)
+{
+	int retval;
+	size_t idx = 0;
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[idx++] = CMD_DAP_STOP_VARMONITOR;
+	retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+
+	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+		LOG_ERROR("CMSIS-DAP command CMD_DAP_STOP_VARMONITOR failed.");
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	return ERROR_OK;
+}
+
+int cmsis_dap_cmd_DAP_Write_Var(unsigned int address, unsigned int length, const uint8_t *data)
+{
+	size_t idx = 0;
+	int retval;
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[idx++] = CMD_DAP_WRITE_VAR;
+
+	command[idx++] = (address) & 0xff;
+	command[idx++] = (address >> 8) & 0xff;
+	command[idx++] = (address >> 16) & 0xff;
+	command[idx++] = (address >> 24) & 0xff;
+
+	command[idx++] = (length) & 0xff;
+	command[idx++] = (length >> 8) & 0xff;
+	command[idx++] = (length >> 16) & 0xff;
+	command[idx++] = (length >> 24) & 0xff;
+
+	command[idx++] = (data[0]) & 0xff;
+	command[idx++] = (data[1]) & 0xff;
+	command[idx++] = (data[2]) & 0xff;
+	command[idx++] = (data[3]) & 0xff;
+	command[idx++] = (data[4]) & 0xff;
+	command[idx++] = (data[5]) & 0xff;
+	command[idx++] = (data[6]) & 0xff;
+	command[idx++] = (data[7]) & 0xff;
+
+	retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK)
+		return ERROR_FAIL;
+
+	return ERROR_OK;
+}
+
+int cmsis_dap_cmd_DAP_Puase_VarMonitor(unsigned char status)
+{
+	size_t idx = 0;
+	int retval;
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[idx++] = CMD_DAP_PAUCE_VARMONITOR;
+	command[idx++] = status;
+
+	retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK)
+		return ERROR_FAIL;
+
+	return ERROR_OK;
+}
+
+int cmsis_dap_cmd_write_offline_head(uint8_t *buffer, uint32_t len)
+{
+    int retval;
+    size_t idx = 0;
+    uint8_t *command = cmsis_dap_handle->command;
+    uint8_t *ptr = buffer;
+
+    if (buffer == NULL) {
+        LOG_ERROR(" Write header parameter error, buffer is null");
+        return ERROR_FAIL;
+    }
+
+    command[idx++] = CMD_DAP_OFFLINE_HEAD;
+    command[idx++] = (len & 0xff);
+    command[idx++] = ((len >> 8) & 0xff);
+    command[idx++] = ((len >> 16) & 0xff);
+    command[idx++] = ((len >> 24) & 0xff);
+
+    for (uint32_t i = 0; i < len; i++) {
+        command[idx++] = *ptr;
+        ptr++;
+    }
+
+    retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+    if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+        return ERROR_FAIL;
+    }
+    return ERROR_OK;
+}
+
+int cmsis_dap_cmd_write_offline_data(uint8_t *buffer, uint32_t len)
+{
+    int retval;
+    size_t idx = 0;
+    uint8_t *command = cmsis_dap_handle->command;
+    uint8_t *ptr = buffer;
+    uint32_t send_len;
+    uint32_t group_num;
+
+    if (buffer == NULL) {
+        LOG_ERROR(" Write header parameter error, buffer is null");
+        return ERROR_FAIL;
+    }
+
+    group_num = len / HISPARK_OFFLINE_ONCE_SEND_DATA;
+    if (group_num > 0) {
+        for (int i = 0; i < group_num; i++) {
+            idx = 0;
+            send_len = HISPARK_OFFLINE_ONCE_SEND_DATA;
+            command[idx++] = CMD_DAP_OFFLINE_DATA;
+            command[idx++] = (send_len & 0xff);
+            command[idx++] = ((send_len >> 8) & 0xff);
+            command[idx++] = ((send_len >> 16) & 0xff);
+            command[idx++] = ((send_len >> 24) & 0xff);
+            for (int j = 0; j < send_len; j++) {
+                command[idx++] = *ptr;
+                ptr++;
+            }
+            retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+            if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+                LOG_ERROR("CMSIS-DAP command offline_write_data failed. retval:%d", retval);
+                return ERROR_FAIL;
+            }
+        }
+    }
+    send_len = len % HISPARK_OFFLINE_ONCE_SEND_DATA;
+    if (send_len > 0) {
+        idx = 0;
+        command[idx++] = CMD_DAP_OFFLINE_DATA;
+        command[idx++] = (send_len & 0xff);
+        command[idx++] = ((send_len >> 8) & 0xff);
+        command[idx++] = ((send_len >> 16) & 0xff);
+        command[idx++] = ((send_len >> 24) & 0xff);
+        for (int k = 0; k < send_len; k++) {
+            command[idx++] = *ptr;
+            ptr++;
+        }
+        retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+        if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+            LOG_ERROR("CMSIS-DAP command offline_write_data failed. retval:%d", retval);
+            return ERROR_FAIL;
+        }
+    }
+    return ERROR_OK;
+}
+
+int cmsis_dap_cmd_write_offline_stop(uint8_t status)
+{
+    int retval;
+    size_t idx = 0;
+    uint8_t *command = cmsis_dap_handle->command;
+
+    command[idx++] = CMD_DAP_OFFLINE_STOP;
+    command[idx++] = status;
+    retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+    if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+        LOG_ERROR("CMSIS-DAP command offline_stop failed. retval:%d", retval);
+        return ERROR_JTAG_DEVICE_ERROR;
+    }
+    return ERROR_OK;
+}
+#endif /* HISPARK_TRACE_MODIFIES */
+
 static int cmsis_dap_cmd_dap_swj_pins(uint8_t pins, uint8_t mask, uint32_t delay, uint8_t *input)
 {
 	uint8_t *command = cmsis_dap_handle->command;
@@ -448,6 +791,9 @@ static int cmsis_dap_cmd_dap_info(uint8_t info, uint8_t **data)
 	int retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
 	if (retval != ERROR_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_INFO failed.");
+#ifdef HISPARK_TRACE_MODIFIES
+        LOG_ERROR("The USB connection between the HiSpark-Trace and the PC may be faulty.Please try to remove and insert the USB connection of the HiSpark-Trace!");
+#endif /* HISPARK_TRACE_MODIFIES */
 		return ERROR_JTAG_DEVICE_ERROR;
 	}
 
@@ -988,6 +1334,11 @@ static int cmsis_dap_get_serial_info(void)
 	if (data[0]) /* strlen */
 		LOG_INFO("CMSIS-DAP: Serial# = %s", &data[1]);
 
+	if (strcmp(&data[1], "stm32f105") == 0) {
+		m_isStm32f105 = true;
+	} else {
+		m_isStm32f105 = false;
+	}
 	return ERROR_OK;
 }
 
@@ -1027,6 +1378,28 @@ static int cmsis_dap_get_caps_info(void)
 				LOG_INFO("CMSIS-DAP: %s", info_caps_str[i]);
 		}
 	}
+#ifdef HISPARK_TRACE_MODIFIES
+	else {
+		/* Receives residual frames. */
+		data = cmsis_dap_handle->packet_buffer;
+		/* get reply */
+		retval = cmsis_dap_handle->backend->read(cmsis_dap_handle, LIBUSB_TIMEOUT_MS);
+		if (retval < 0)
+			return retval;
+
+		/* data[1] = 0x1, data[2] = 0x33 */
+		if (data[1] == 1) {
+			uint8_t caps = data[2];
+
+			cmsis_dap_handle->caps = caps;
+
+			if (caps & INFO_CAPS_SWD)
+				LOG_INFO("CMSIS-DAP: %s", info_caps_str[0]);
+			if (caps & INFO_CAPS_JTAG)
+				LOG_INFO("CMSIS-DAP: %s", info_caps_str[1]);
+		}
+	}
+#endif /* HISPARK_TRACE_MODIFIES */
 
 	return ERROR_OK;
 }
@@ -1127,7 +1500,11 @@ static int cmsis_dap_swd_switch_seq(enum swd_special_seq seq)
 		s_len = swd_seq_dormant_to_jtag_len;
 		break;
 	default:
+#ifdef HISPARK_TRACE_MODIFIES
 		LOG_ERROR("Sequence %d not supported", seq);
+#else
+		LOG_DEBUG("Sequence %d not supported", seq);
+#endif /* HISPARK_TRACE_MODIFIES */
 		return ERROR_FAIL;
 	}
 
@@ -1576,7 +1953,19 @@ static void cmsis_dap_state_move(void)
 	LOG_DEBUG_IO("state move from %s to %s: %d clocks, %02X on tms",
 		tap_state_name(tap_get_state()), tap_state_name(tap_get_end_state()),
 		tms_scan_bits, tms_scan);
-	cmsis_dap_add_tms_sequence(&tms_scan, tms_scan_bits);
+	if (m_isStm32f105) {
+		if (queued_seq_count >= MAX_CMD_COUNT
+			|| (queued_seq_buf_end + MOVE_JTAG_STATE_CMD_LEN) > QUEUED_SEQ_BUF_LEN) {
+			cmsis_dap_flush();
+		}
+		queued_seq_buf[queued_seq_buf_end++] = 0;
+		queued_seq_buf[queued_seq_buf_end++] = tms_scan_bits;
+		queued_seq_buf[queued_seq_buf_end++] = tms_scan;
+
+		++queued_seq_count;
+	} else {
+		cmsis_dap_add_tms_sequence(&tms_scan, tms_scan_bits);
+	}
 
 	tap_set_state(tap_get_end_state());
 }

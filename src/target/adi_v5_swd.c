@@ -45,6 +45,10 @@
 
 /* for debug, set do_sync to true to force synchronous transfers */
 static bool do_sync;
+#ifdef HISPARK_TRACE_MODIFIES
+extern unsigned int g_swdInitFlag;
+extern unsigned int g_swdInitLogCount;
+#endif /* HISPARK_TRACE_MODIFIES */
 
 static struct adiv5_dap *swd_multidrop_selected_dap;
 
@@ -319,7 +323,7 @@ static int swd_connect_single(struct adiv5_dap *dap)
 {
 	int retval;
 	uint32_t dpidr = 0xdeadbeef;
-	int64_t timeout = timeval_ms() + 500;
+	int64_t timeout = timeval_ms() + 5000;
 
 	do {
 		if (dap->switch_through_dormant) {
@@ -355,15 +359,18 @@ static int swd_connect_single(struct adiv5_dap *dap)
 				break;
 		}
 
-		alive_sleep(1);
-
 		dap->switch_through_dormant = !dap->switch_through_dormant;
 	} while (timeval_ms() < timeout);
 
 	dap->select = DP_SELECT_INVALID;
 
 	if (retval != ERROR_OK) {
+#ifdef HISPARK_TRACE_MODIFIES
 		LOG_ERROR("Error connecting DP: cannot read IDR");
+#else
+		LOG_DEBUG("Error connecting DP: cannot read IDR");
+#endif /* HISPARK_TRACE_MODIFIES */
+
 		return retval;
 	}
 
@@ -378,9 +385,6 @@ static int swd_connect_single(struct adiv5_dap *dap)
 		retval = swd_run_inner(dap);
 		if (retval != ERROR_WAIT)
 			break;
-
-		alive_sleep(10);
-
 	} while (timeval_ms() < timeout);
 
 	return retval;
@@ -431,9 +435,33 @@ static int swd_connect(struct adiv5_dap *dap)
 			status = swd_run_inner(dap);
 	}
 
+#ifdef HISPARK_TRACE_MODIFIES
+    if (status == ERROR_OK) {
+        status = dap_dp_init(dap);
+    } else {
+        if (g_swdInitFlag) {
+			if (g_swdInitLogCount == SWDINITCOUNT - 1) {
+				g_swdInitFlag = 0;
+				g_swdInitLogCount = 0;
+				LOG_ERROR("Error connecting DP: cannot read IDR, Tried %d times!", SWDINITCOUNT);
+				LOG_ERROR("*********************************************************************************************************\r\n"
+						  "       *                                                                                                       *\r\n"
+						  "       * Connecting to target failed. Please check:                                                            *\r\n"
+						  "       *                                                                                                       *\r\n"
+						  "       * 1.Debugger's Settings, such as the Tool name, JTAG/SWD interface and speed                            *\r\n"
+						  "       *                                                                                                       *\r\n"
+						  "       * 2.Debugger is connected to Target board by JTAG/SWD cable                                             *\r\n"
+						  "       *                                                                                                       *\r\n"
+						  "       * 3.Target Board is powered on                                                                          *\r\n"
+						  "       *                                                                                                       *\r\n"
+						  "       *********************************************************************************************************");
+			}
+		}	    
+	}
+#else /* HISPARK_TRACE_MODIFIES */
 	if (status == ERROR_OK)
 		status = dap_dp_init(dap);
-
+#endif /* HISPARK_TRACE_MODIFIES */
 	return status;
 }
 
@@ -526,10 +554,10 @@ static int swd_queue_ap_bankselect(struct adiv5_ap *ap, unsigned reg)
 	sel = (ap->ap_num << 24) | (reg & 0x000000F0);
 	if (dap->select != DP_SELECT_INVALID)
 		sel |= dap->select & DP_SELECT_DPBANK;
-
+#ifndef HISPARK_TRACE_MODIFIES
 	if (sel == dap->select)
 		return ERROR_OK;
-
+#endif /* HISPARK_TRACE_MODIFIES */
 	dap->select = sel;
 
 	retval = swd_queue_dp_write_inner(dap, DP_SELECT, sel);
@@ -647,6 +675,50 @@ const struct dap_ops swd_dap_ops = {
 	.quit = swd_quit,
 };
 
+
+COMMAND_HANDLER(handle_swd_halt_cortexm3)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	struct arm *arm = target_to_arm(target);
+	struct adiv5_dap *dap = arm->dap;
+	struct adiv5_ap *ap = NULL;
+	int status = ERROR_FAIL;
+	struct timeval tv;
+
+	gettimeofday(&tv,NULL);
+	LOG_DEBUG("second:%ld", tv.tv_sec);	
+	LOG_DEBUG("millisecond:%ld",tv.tv_sec*1000 + tv.tv_usec/1000);  
+
+    //status = ahbap_debugport_init(dap);//replace to initialize dap and ap
+	//if (status != ERROR_OK)
+	//	return status;
+
+	/* Search for the MEM-AP */
+	status = dap_find_ap(dap, AP_TYPE_AHB3_AP, &ap);
+	if (status != ERROR_OK) {
+		LOG_ERROR("Could not find MEM-AP to control the core");
+		return status;
+	}
+	/* Leave (only) generic DAP stuff for debugport_init(); */
+	ap->memaccess_tck = 8;
+
+	status = mem_ap_init(ap);
+	if (status != ERROR_OK)
+		return status;
+
+	swd_queue_ap_write(ap, 0, 0xa2000002);//struct adiv5_ap *ap
+	swd_queue_ap_write(ap, 0x4, 0xe000edf0);//struct adiv5_ap *ap
+	swd_queue_ap_write(ap, 0x00000010, 0xa05f0003);//struct adiv5_ap *ap
+	/* force clear all sticky faults */
+	swd_clear_sticky_errors(dap);//struct adiv5_dap *dap
+	status = swd_run(dap);//struct adiv5_dap *dap
+
+	gettimeofday(&tv,NULL);
+	LOG_DEBUG("second:%ld", tv.tv_sec);	
+	LOG_DEBUG("millisecond:%ld",tv.tv_sec*1000 + tv.tv_usec/1000); 
+	return status;
+}
+
 static const struct command_registration swd_commands[] = {
 	{
 		/*
@@ -661,6 +733,13 @@ static const struct command_registration swd_commands[] = {
 		.mode = COMMAND_CONFIG,
 		.help = "declare a new SWD DAP"
 	},
+	{
+		.name = "halt_cortexm3",
+		.handler = handle_swd_halt_cortexm3,
+		.mode = COMMAND_ANY,
+		.help = "send halt cortexm3",
+		.usage = "swd halt_cortexm3",
+	},
 	COMMAND_REGISTRATION_DONE
 };
 
@@ -670,7 +749,7 @@ static const struct command_registration swd_handlers[] = {
 		.mode = COMMAND_ANY,
 		.help = "SWD command group",
 		.chain = swd_commands,
-		.usage = "",
+		.usage = "swd",
 	},
 	COMMAND_REGISTRATION_DONE
 };

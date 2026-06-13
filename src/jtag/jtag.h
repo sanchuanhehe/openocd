@@ -260,6 +260,9 @@ void jtag_set_flush_queue_sleep(int ms);
  * try reset + init.
  */
 int jtag_init(struct command_context *cmd_ctx);
+#ifdef HISPARK_TRACE_MODIFIES
+int jtag_initAgain(void);
+#endif /* HISPARK_TRACE_MODIFIES */
 
 /** reset, then initialize JTAG chain */
 int jtag_init_reset(struct command_context *cmd_ctx);

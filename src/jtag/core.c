@@ -113,6 +113,9 @@ struct jtag_event_callback {
 /* callbacks to inform high-level handlers about JTAG state changes */
 static struct jtag_event_callback *jtag_event_callbacks;
 
+#ifdef HISPARK_TRACE_MODIFIES
+static struct command_context g_cmd_ctx;
+#endif /* HISPARK_TRACE_MODIFIES */
 extern struct adapter_driver *adapter_driver;
 
 void jtag_set_flush_queue_sleep(int ms)
@@ -1663,6 +1666,10 @@ int jtag_init_reset(struct command_context *cmd_ctx)
 
 int jtag_init(struct command_context *cmd_ctx)
 {
+#ifdef HISPARK_TRACE_MODIFIES
+	g_cmd_ctx = *cmd_ctx;
+#endif /* HISPARK_TRACE_MODIFIES */
+
 	int retval = adapter_init(cmd_ctx);
 	if (retval != ERROR_OK)
 		return retval;
@@ -1686,6 +1693,16 @@ int jtag_init(struct command_context *cmd_ctx)
 
 	return ERROR_OK;
 }
+
+#ifdef HISPARK_TRACE_MODIFIES
+int jtag_initAgain(void)
+{
+	if (Jim_Eval_Named(g_cmd_ctx.interp, "jtag_init", __FILE__, __LINE__) != JIM_OK)
+		return ERROR_FAIL;
+
+	return ERROR_OK;
+}
+#endif /* HISPARK_TRACE_MODIFIES */
 
 void jtag_set_verify(bool enable)
 {

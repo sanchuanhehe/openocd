@@ -374,6 +374,9 @@ uint32_t dtmcontrol_scan_via_bscan(struct target *target, uint32_t out)
 	return in;
 }
 
+static int riscvcs_init_target(struct command_context *cmd_ctx,
+		struct target *target);
+
 static uint32_t dtmcontrol_scan(struct target *target, uint32_t out)
 {
 	struct scan_field field;
@@ -444,6 +447,7 @@ static int riscv_init_target(struct command_context *cmd_ctx,
 {
 	LOG_DEBUG("riscv_init_target()");
 	RISCV_INFO(info);
+	info->debug_type = RISCV_DTM;
 	info->cmd_ctx = cmd_ctx;
 
 	select_dtmcontrol.num_bits = target->tap->ir_length;
@@ -1127,9 +1131,11 @@ static int riscv_examine(struct target *target)
 	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
 
 	RISCV_INFO(info);
-	uint32_t dtmcontrol = dtmcontrol_scan(target, 0);
-	LOG_DEBUG("dtmcontrol=0x%x", dtmcontrol);
-	info->dtm_version = get_field(dtmcontrol, DTMCONTROL_VERSION);
+	if (info->debug_type == RISCV_DTM) {
+		uint32_t dtmcontrol = dtmcontrol_scan(target, 0);
+		LOG_DEBUG("dtmcontrol=0x%x", dtmcontrol);
+		info->dtm_version = get_field(dtmcontrol, DTMCONTROL_VERSION);
+	}
 	LOG_DEBUG("  version=0x%x", info->dtm_version);
 
 	struct target_type *tt = get_target_type(target);
@@ -1273,6 +1279,7 @@ int riscv_halt(struct target *target)
 static int riscv_assert_reset(struct target *target)
 {
 	LOG_DEBUG("[%d]", target->coreid);
+	LOG_DEBUG("RISCV ASSERT RESET");
 	struct target_type *tt = get_target_type(target);
 	riscv_invalidate_register_cache(target);
 	return tt->assert_reset(target);
@@ -1532,7 +1539,7 @@ static int riscv_mmu(struct target *target, int *enabled)
 	/* Don't use MMU in explicit or effective M (machine) mode */
 	riscv_reg_t priv;
 	if (riscv_get_register(target, &priv, GDB_REGNO_PRIV) != ERROR_OK) {
-		LOG_ERROR("Failed to read priv register.");
+		LOG_INFO("Failed to read priv register.");
 		return ERROR_FAIL;
 	}
 
@@ -1992,6 +1999,10 @@ static int riscv_checksum_memory(struct target *target,
 		target_addr_t address, uint32_t count,
 		uint32_t *checksum)
 {
+#ifdef HISPARK_TRACE_MODIFIES
+    /* Do not use the default CRC. */
+    return ERROR_FAIL;
+#endif /* HISPARK_TRACE_MODIFIES */
 	struct working_area *crc_algorithm;
 	struct reg_param reg_params[2];
 	int retval;
@@ -2372,7 +2383,7 @@ COMMAND_HANDLER(riscv_set_prefer_sba)
 	struct target *target = get_current_target(CMD_CTX);
 	RISCV_INFO(r);
 	bool prefer_sba;
-	LOG_WARNING("`riscv set_prefer_sba` is deprecated. Please use `riscv set_mem_access` instead.");
+	LOG_INFO("`riscv set_prefer_sba` is deprecated. Please use `riscv set_mem_access` instead.");
 	if (CMD_ARGC != 1) {
 		LOG_ERROR("Command takes exactly 1 parameter");
 		return ERROR_COMMAND_SYNTAX_ERROR;
@@ -2596,6 +2607,7 @@ COMMAND_HANDLER(riscv_set_expose_csrs)
 	RISCV_INFO(info);
 	int ret = ERROR_OK;
 
+	INIT_LIST_HEAD(&(info->expose_csr));
 	for (unsigned int i = 0; i < CMD_ARGC; i++) {
 		ret = parse_ranges(&info->expose_csr, CMD_ARGV[i], "csr", 0xfff);
 		if (ret != ERROR_OK)
@@ -3200,6 +3212,67 @@ struct target_type riscv_target = {
 	.data_bits = riscv_data_bits
 };
 
+static int riscvcs_target_create(struct target *target, Jim_Interp *interp)
+{
+	target->arch_info = calloc(1, sizeof(struct riscv_info));
+	if (!target->arch_info)
+		return ERROR_FAIL;
+
+	if (target->private_config == NULL) {
+		LOG_ERROR("adiv5_jim_configure failed!");
+		return ERROR_FAIL;
+	}
+ 	return ERROR_OK;
+}
+
+
+struct target_type riscvcs_target = {
+	.name = "riscvcs",
+
+	.init_target = riscvcs_init_target, // CoreSight
+	.deinit_target = riscv_deinit_target,
+	.target_create = riscvcs_target_create, // Coresight
+	.target_jim_configure = adiv5_jim_configure, // CoreSight
+	.examine = riscv_examine,
+
+	/* poll current target status */
+	.poll = old_or_new_riscv_poll,
+
+	.halt = riscv_halt,
+	.resume = riscv_target_resume,
+	.step = old_or_new_riscv_step,
+
+	.assert_reset = riscv_assert_reset,
+	.deassert_reset = riscv_deassert_reset,
+
+	.read_memory = riscv_read_memory,
+	.write_memory = riscv_write_memory,
+	.read_phys_memory = riscv_read_phys_memory,
+	.write_phys_memory = riscv_write_phys_memory,
+
+	.checksum_memory = riscv_checksum_memory,
+
+	.mmu = riscv_mmu,
+	.virt2phys = riscv_virt2phys,
+
+	.get_gdb_reg_list = riscv_get_gdb_reg_list,
+	.get_gdb_reg_list_noread = riscv_get_gdb_reg_list_noread,
+
+	.add_breakpoint = riscv_add_breakpoint,
+	.remove_breakpoint = riscv_remove_breakpoint,
+
+	.add_watchpoint = riscv_add_watchpoint,
+	.remove_watchpoint = riscv_remove_watchpoint,
+	.hit_watchpoint = riscv_hit_watchpoint,
+
+	.arch_state = riscv_arch_state,
+
+	.run_algorithm = riscv_run_algorithm,
+
+	.commands = riscv_command_handlers,
+
+	.address_bits = riscv_xlen_nonconst,
+};
 /*** RISC-V Interface ***/
 
 /* Initializes the shared RISC-V structure. */
@@ -3315,6 +3388,9 @@ static void riscv_invalidate_register_cache(struct target *target)
 	register_cache_invalidate(target->reg_cache);
 	for (size_t i = 0; i < target->reg_cache->num_regs; ++i) {
 		struct reg *reg = &target->reg_cache->reg_list[i];
+		if (reg->exist == false) {
+			continue;
+		}
 		reg->valid = false;
 	}
 }
@@ -3696,6 +3772,10 @@ const char *gdb_regno_name(enum gdb_regno regno)
 			return "priv";
 		case GDB_REGNO_SATP:
 			return "satp";
+#ifdef HISPARK_TRACE_MODIFIES
+		case GDB_REGNO_CXCPTSC:
+			return "cxcptsc";
+#endif /* HISPARK_TRACE_MODIFIES */
 		case GDB_REGNO_VTYPE:
 			return "vtype";
 		case GDB_REGNO_VL:
@@ -3768,7 +3848,7 @@ const char *gdb_regno_name(enum gdb_regno regno)
 			if (regno <= GDB_REGNO_XPR31)
 				sprintf(buf, "x%d", regno - GDB_REGNO_ZERO);
 			else if (regno >= GDB_REGNO_CSR0 && regno <= GDB_REGNO_CSR4095)
-				sprintf(buf, "csr%d", regno - GDB_REGNO_CSR0);
+				sprintf(buf, "csr0x%x", regno - GDB_REGNO_CSR0);
 			else if (regno >= GDB_REGNO_FPR0 && regno <= GDB_REGNO_FPR31)
 				sprintf(buf, "f%d", regno - GDB_REGNO_FPR0);
 			else
@@ -4305,7 +4385,7 @@ int riscv_init_registers(struct target *target)
 			if (csr_info[csr_info_index].number == csr_number) {
 				r->name = csr_info[csr_info_index].name;
 			} else {
-				sprintf(reg_name, "csr%d", csr_number);
+				sprintf(reg_name, "csr0x%x", csr_number);
 				/* Assume unnamed registers don't exist, unless we have some
 				 * configuration that tells us otherwise. That's important
 				 * because eg. Eclipse crashes if a target has too many
@@ -4535,4 +4615,29 @@ void riscv_add_bscan_tunneled_scan(struct target *target, struct scan_field *fie
 		ctxt->tunneled_dr[3].out_value = bscan_zero;
 	}
 	jtag_add_dr_scan(target->tap, ARRAY_SIZE(ctxt->tunneled_dr), ctxt->tunneled_dr, TAP_IDLE);
+}
+
+static int riscvcs_init_target(struct command_context *cmd_ctx,
+		struct target *target)
+{
+	LOG_DEBUG("riscvcs_init_target()");
+	if (!target->arch_info) {
+		target->arch_info = calloc(1, sizeof(struct riscv_info));
+	}
+	if (!target->arch_info) {
+		return ERROR_FAIL;
+    }
+	RISCV_INFO(info);
+	riscv_info_init(target, info);
+	// according to RISC-V External Debug Support Page65
+	// 1: Version described in spec version 0.13. 
+	info->dtm_version = 1;
+	info->cmd_ctx = cmd_ctx;
+	info->debug_type = RISCV_CORESIGHT;
+	
+	riscv_semihosting_init(target);
+
+	target->debug_reason = DBG_REASON_DBGRQ;
+
+	return ERROR_OK;
 }

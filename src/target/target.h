@@ -123,7 +123,7 @@ struct target {
 	int target_number;					/* DO NOT USE!  field to be removed in 2010 */
 	struct jtag_tap *tap;				/* where on the jtag chain is this */
 	int32_t coreid;						/* which device on the TAP? */
-
+	int ap_sel;							/* for RISCV-CORESIGHT */
 	/** Should we defer examine to later */
 	bool defer_examine;
 

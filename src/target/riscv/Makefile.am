@@ -10,9 +10,11 @@ noinst_LTLIBRARIES += %D%/libriscv.la
        %D%/opcodes.h \
        %D%/program.h \
        %D%/riscv.h \
+       %D%/batchcs.h \
        %D%/batch.c \
        %D%/program.c \
        %D%/riscv-011.c \
        %D%/riscv-013.c \
        %D%/riscv.c \
-       %D%/riscv_semihosting.c
+       %D%/riscv_semihosting.c \
+       %D%/batchcs.c

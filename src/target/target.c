@@ -50,7 +50,11 @@
 
 /* default halt wait timeout (ms) */
 #define DEFAULT_HALT_TIMEOUT 5000
-
+extern int led_load_dump_flag;
+#ifdef HISPARK_TRACE_MODIFIES
+#define MONITOR_PAUCE          0x0
+#define MONITOR_RESUME         0x1
+#endif /* HISPARK_TRACE_MODIFIES */
 static int target_read_buffer_default(struct target *target, target_addr_t address,
 		uint32_t count, uint8_t *buffer);
 static int target_write_buffer_default(struct target *target, target_addr_t address,
@@ -106,6 +110,8 @@ extern struct target_type riscv_target;
 extern struct target_type mem_ap_target;
 extern struct target_type esirisc_target;
 extern struct target_type arcv2_target;
+extern struct target_type riscvcs_target;
+extern struct target_type busjtag_target;
 
 static struct target_type *target_types[] = {
 	&arm7tdmi_target,
@@ -147,7 +153,9 @@ static struct target_type *target_types[] = {
 	&esirisc_target,
 	&arcv2_target,
 	&aarch64_target,
-	&mips_mips64_target,
+	&mips_mips64_target,	
+	&riscvcs_target,
+	&busjtag_target,
 	NULL,
 };
 
@@ -159,6 +167,12 @@ static LIST_HEAD(target_reset_callback_list);
 static LIST_HEAD(target_trace_callback_list);
 static const int polling_interval = TARGET_DEFAULT_POLLING_INTERVAL;
 static LIST_HEAD(empty_smp_targets);
+
+#ifdef HISPARK_TRACE_MODIFIES
+extern int g_au160WriteFlag;
+extern int g_pollEnableSwitch;
+extern int g_livewatchOpenFLag;
+#endif /* HISPARK_TRACE_MODIFIES */
 
 static const struct jim_nvp nvp_assert[] = {
 	{ .name = "assert", NVP_ASSERT },
@@ -1314,7 +1328,32 @@ int target_read_memory(struct target *target,
 		LOG_ERROR("Target %s doesn't support read_memory", target_name(target));
 		return ERROR_FAIL;
 	}
+#ifdef HISPARK_TRACE_MODIFIES
+#ifdef _WIN32
+	LARGE_INTEGER timeStart;    //large_integer开始时间
+	LARGE_INTEGER timeEnd;      //结束时间
+	LARGE_INTEGER frequency;    //计时器频率
+	QueryPerformanceFrequency(&frequency);//返回硬件支持的高精度计数器的频率
+	double quadpart = (double)frequency.QuadPart;
+	double elapsed;
+
+	if (g_au160WriteFlag) {
+		QueryPerformanceCounter(&timeStart);
+	}
+#endif
+	int result = target->type->read_memory(target, address, size, count, buffer);
+#ifdef _WIN32
+	if (g_au160WriteFlag) {
+		QueryPerformanceCounter(&timeEnd);
+		elapsed = (timeEnd.QuadPart - timeStart.QuadPart) / quadpart;
+		LOG_INFO("target_read_memory takes %f", elapsed);
+	}
+#endif
+
+	return result;
+#else /* HISPARK_TRACE_MODIFIES */
 	return target->type->read_memory(target, address, size, count, buffer);
+#endif /* HISPARK_TRACE_MODIFIES */
 }
 
 int target_read_phys_memory(struct target *target,
@@ -1342,7 +1381,31 @@ int target_write_memory(struct target *target,
 		LOG_ERROR("Target %s doesn't support write_memory", target_name(target));
 		return ERROR_FAIL;
 	}
+#ifdef HISPARK_TRACE_MODIFIES
+#ifdef _WIN32
+	LARGE_INTEGER timeStart;    //large_integer开始时间
+	LARGE_INTEGER timeEnd;      //结束时间
+	LARGE_INTEGER frequency;    //计时器频率
+	QueryPerformanceFrequency(&frequency);//返回硬件支持的高精度计数器的频率
+	double quadpart = (double)frequency.QuadPart;
+	double elapsed;
+
+	if (g_au160WriteFlag) {
+		QueryPerformanceCounter(&timeStart);
+	}
+#endif
+	int result = target->type->write_memory(target, address, size, count, buffer);
+#ifdef _WIN32
+	if (g_au160WriteFlag) {
+		QueryPerformanceCounter(&timeEnd);
+		elapsed = (timeEnd.QuadPart - timeStart.QuadPart) / quadpart;
+		LOG_INFO("target_write_memory takes %f", elapsed);
+	}
+#endif
+	return result;
+#else /* HISPARK_TRACE_MODIFIES */
 	return target->type->write_memory(target, address, size, count, buffer);
+#endif /* HISPARK_TRACE_MODIFIES */
 }
 
 int target_write_phys_memory(struct target *target,
@@ -2615,6 +2678,21 @@ int target_read_u64(struct target *target, target_addr_t address, uint64_t *valu
 
 int target_read_u32(struct target *target, target_addr_t address, uint32_t *value)
 {
+#ifdef HISPARK_TRACE_MODIFIES
+#ifdef _WIN32
+	LARGE_INTEGER timeStart;    //large_integer开始时间
+	LARGE_INTEGER timeEnd;      //结束时间
+	LARGE_INTEGER frequency;    //计时器频率
+	QueryPerformanceFrequency(&frequency);//返回硬件支持的高精度计数器的频率
+	double quadpart = (double)frequency.QuadPart;
+	double elapsed;
+
+	if (g_au160WriteFlag) {
+		QueryPerformanceCounter(&timeStart);
+	}
+#endif
+#endif /* HISPARK_TRACE_MODIFIES */
+
 	uint8_t value_buf[4];
 	if (!target_was_examined(target)) {
 		LOG_ERROR("Target not examined yet");
@@ -2633,7 +2711,15 @@ int target_read_u32(struct target *target, target_addr_t address, uint32_t *valu
 		LOG_DEBUG("address: " TARGET_ADDR_FMT " failed",
 				  address);
 	}
-
+#ifdef HISPARK_TRACE_MODIFIES
+#ifdef _WIN32
+	if (g_au160WriteFlag) {
+		QueryPerformanceCounter(&timeEnd);
+		elapsed = (timeEnd.QuadPart - timeStart.QuadPart) / quadpart;
+		LOG_INFO("target_read_u32 takes %f", elapsed);
+	}
+#endif
+#endif /* HISPARK_TRACE_MODIFIES */
 	return retval;
 }
 
@@ -2706,6 +2792,21 @@ int target_write_u64(struct target *target, target_addr_t address, uint64_t valu
 
 int target_write_u32(struct target *target, target_addr_t address, uint32_t value)
 {
+#ifdef HISPARK_TRACE_MODIFIES
+#ifdef _WIN32
+	LARGE_INTEGER timeStart;    //large_integer开始时间
+	LARGE_INTEGER timeEnd;      //结束时间
+	LARGE_INTEGER frequency;    //计时器频率
+	QueryPerformanceFrequency(&frequency);//返回硬件支持的高精度计数器的频率
+	double quadpart = (double)frequency.QuadPart;
+	double elapsed;
+
+	if (g_au160WriteFlag) {
+		QueryPerformanceCounter(&timeStart);
+	}
+#endif
+#endif /* HISPARK_TRACE_MODIFIES */
+
 	int retval;
 	uint8_t value_buf[4];
 	if (!target_was_examined(target)) {
@@ -2722,6 +2823,15 @@ int target_write_u32(struct target *target, target_addr_t address, uint32_t valu
 	if (retval != ERROR_OK)
 		LOG_DEBUG("failed: %i", retval);
 
+#ifdef HISPARK_TRACE_MODIFIES
+#ifdef _WIN32
+	if (g_au160WriteFlag) {
+		QueryPerformanceCounter(&timeEnd);
+		elapsed = (timeEnd.QuadPart - timeStart.QuadPart) / quadpart;
+		LOG_INFO("target_write_u32 takes %f", elapsed);
+	}
+#endif
+#endif /* HISPARK_TRACE_MODIFIES */
 	return retval;
 }
 
@@ -2982,6 +3092,17 @@ static int handle_target(void *priv)
 		/* polling is disabled currently */
 		return ERROR_OK;
 	}
+#ifdef HISPARK_TRACE_MODIFIES
+	if (g_livewatchOpenFLag == 1) {
+		if (g_pollEnableSwitch == 0) {
+			retval = cmsis_dap_cmd_DAP_Puase_VarMonitor(MONITOR_PAUCE);
+			if (retval != ERROR_OK) {
+				return retval;
+			}
+			g_pollEnableSwitch = 1;
+		}
+	}
+#endif /* HISPARK_TRACE_MODIFIES */
 
 	/* we do not want to recurse here... */
 	static int recursive;
@@ -3079,6 +3200,18 @@ static int handle_target(void *priv)
 
 			/* Since we succeeded, we reset backoff count */
 			target->backoff.times = 0;
+
+#ifdef HISPARK_TRACE_MODIFIES
+			if (g_livewatchOpenFLag == 1) {
+				if (g_pollEnableSwitch) {
+					retval = cmsis_dap_cmd_DAP_Puase_VarMonitor(MONITOR_RESUME);
+					if (retval != ERROR_OK) {
+						return retval;
+					}
+					g_pollEnableSwitch = 0;
+				}
+			}
+#endif /* HISPARK_TRACE_MODIFIES */
 		}
 	}
 
@@ -3370,7 +3503,7 @@ COMMAND_HANDLER(handle_resume_command)
 		COMMAND_PARSE_ADDRESS(CMD_ARGV[0], addr);
 		current = 0;
 	}
-
+	LOG_INFO("Target resume at: 0x%" TARGET_PRIxADDR, addr);
 	return target_resume(target, current, addr, 1, 0);
 }
 
@@ -3664,7 +3797,7 @@ COMMAND_HANDLER(handle_load_image_command)
 	target_addr_t min_address = 0;
 	target_addr_t max_address = -1;
 	struct image image;
-
+	led_load_dump_flag = 1;
 	int retval = CALL_COMMAND_HANDLER(parse_load_image_command,
 			&image, &min_address, &max_address);
 	if (retval != ERROR_OK)
@@ -3735,7 +3868,7 @@ COMMAND_HANDLER(handle_load_image_command)
 	}
 
 	image_close(&image);
-
+	led_load_dump_flag = 0;
 	return retval;
 
 }
@@ -3748,7 +3881,7 @@ COMMAND_HANDLER(handle_dump_image_command)
 	target_addr_t address, size;
 	struct duration bench;
 	struct target *target = get_current_target(CMD_CTX);
-
+	led_load_dump_flag = 1;
 	if (CMD_ARGC != 3)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
@@ -3790,14 +3923,20 @@ COMMAND_HANDLER(handle_dump_image_command)
 		retval = fileio_size(fileio, &filesize);
 		if (retval != ERROR_OK)
 			return retval;
+		retvaltemp = fileio_close(fileio);
+	    if (retvaltemp != ERROR_OK) {
+		    return retvaltemp;
+	    }
 		command_print(CMD,
 				"dumped %zu bytes in %fs (%0.3f KiB/s)", filesize,
 				duration_elapsed(&bench), duration_kbps(&bench, filesize));
+		command_print(CMD,"Dump image success!");
+	} else {
+		led_load_dump_flag = 0;
+		retvaltemp = fileio_close(fileio);
+		if (retvaltemp != ERROR_OK)
+			return retvaltemp;
 	}
-
-	retvaltemp = fileio_close(fileio);
-	if (retvaltemp != ERROR_OK)
-		return retvaltemp;
 
 	return retval;
 }
@@ -3930,13 +4069,14 @@ static COMMAND_HELPER(handle_verify_image_command_internal, enum verify_mode ver
 done:
 	if (diffs > 0)
 		retval = ERROR_FAIL;
+
+	image_close(&image);
 	if ((retval == ERROR_OK) && (duration_measure(&bench) == ERROR_OK)) {
 		command_print(CMD, "verified %" PRIu32 " bytes "
 				"in %fs (%0.3f KiB/s)", image_size,
 				duration_elapsed(&bench), duration_kbps(&bench, image_size));
+	    command_print(CMD,"Verify image success!");
 	}
-
-	image_close(&image);
 
 	return retval;
 }
@@ -5310,6 +5450,7 @@ enum target_cfg_param {
 	TCFG_DEFER_EXAMINE,
 	TCFG_GDB_PORT,
 	TCFG_GDB_MAX_CONNECTIONS,
+	TCFG_AP_SEL
 };
 
 static struct jim_nvp nvp_config_opts[] = {
@@ -5327,6 +5468,7 @@ static struct jim_nvp nvp_config_opts[] = {
 	{ .name = "-defer-examine",    .value = TCFG_DEFER_EXAMINE },
 	{ .name = "-gdb-port",         .value = TCFG_GDB_PORT },
 	{ .name = "-gdb-max-connections",   .value = TCFG_GDB_MAX_CONNECTIONS },
+	{ .name = "-apsel",            .value = TCFG_AP_SEL },
 	{ .name = NULL, .value = -1 }
 };
 
@@ -5617,6 +5759,22 @@ no_params:
 			/* DEFER_EXAMINE */
 			target->defer_examine = true;
 			/* loop for more */
+			break;
+			
+		case TCFG_AP_SEL:
+			if (goi->isconfigure) {
+				e = jim_getopt_wide(goi, &w);
+				if (e != JIM_OK)
+					return e;
+				if (w < 0 || w > 255) {
+					Jim_SetResultString(goi->interp, "Invalid AP number!", -1);
+					return JIM_ERR;
+				}
+				target->ap_sel = (int32_t)w;
+			}else {
+					if (goi->argc != 0)
+					goto no_params;
+			}
 			break;
 
 		case TCFG_GDB_PORT:
@@ -6290,7 +6448,12 @@ static int target_create(struct jim_getopt_info *goi)
 	target->rtos_auto_detect = false;
 
 	target->gdb_port_override = NULL;
+#ifdef HISPARK_TRACE_MODIFIES
+	/* The maximum number of GDB sessions is changed to 20. */
+	target->gdb_max_connections = 20;
+#else /* HISPARK_TRACE_MODIFIES */
 	target->gdb_max_connections = 1;
+#endif /* HISPARK_TRACE_MODIFIES */
 
 	/* Do the rest as "configure" options */
 	goi->isconfigure = 1;

@@ -10,6 +10,8 @@ struct riscv_program;
 #include "gdb_regs.h"
 #include "jtag/jtag.h"
 #include "target/register.h"
+// use ARM-Coresight
+#include "target/arm_adi_v5.h" 
 #include "target/semihosting_common.h"
 #include <helper/command.h>
 
@@ -87,9 +89,14 @@ typedef struct {
 	char *name;
 } range_list_t;
 
+typedef enum {
+	RISCV_DTM = 0,
+	RISCV_CORESIGHT = 1
+} debug_type_t;
+
 struct riscv_info {
 	unsigned int common_magic;
-
+	debug_type_t debug_type;
 	unsigned dtm_version;
 
 	struct command_context *cmd_ctx;
@@ -174,6 +181,9 @@ struct riscv_info {
 	int (*dmi_read)(struct target *target, uint32_t *value, uint32_t address);
 	int (*dmi_write)(struct target *target, uint32_t address, uint32_t value);
 
+	int (*dmi_read_fast)(struct target *target, uint32_t *value, uint32_t address);
+	int (*dmi_write_fast)(struct target *target, uint32_t address, uint32_t value);
+	
 	int (*test_sba_config_reg)(struct target *target, target_addr_t legal_address,
 			uint32_t num_words, target_addr_t illegal_address, bool run_sbbusyerror_test);
 

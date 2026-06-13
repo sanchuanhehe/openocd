@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 AC_PREREQ([2.69])
-AC_INIT([openocd], [0.12.0],
+AC_INIT([openocd], [0.12.0-1.0.0.5],
   [OpenOCD Mailing List <openocd-devel@lists.sourceforge.net>])
 AC_CONFIG_SRCDIR([src/openocd.c])
 AC_CONFIG_AUX_DIR([build-aux])
@@ -279,7 +279,19 @@ AC_ARG_ENABLE([parport_giveio],
     AS_HELP_STRING([--enable-parport-giveio],
       [Enable use of giveio for parport (for CygWin only)]),
     [parport_use_giveio=$enableval], [parport_use_giveio=])
+    
+AC_ARG_ENABLE([legacy-ft2232_libftdi],
+  AS_HELP_STRING([--enable-legacy-ft2232_libftdi], [(HITOOL) Enable building support for FT2232 based devices using the libftdi library]),
+  [build_ft2232_libftdi=$enableval], [build_ft2232_libftdi=no])
 
+AC_ARG_ENABLE([legacy-ft2232_ftd2xx],
+  AS_HELP_STRING([--enable-legacy-ft2232_ftd2xx], [(HITOOL) Enable building support for FT2232 based devices using the D2XX library from ftdichip.com]),
+  [build_ft2232_ftd2xx=yes], [build_ft2232_ftd2xx=no])
+  
+AC_ARG_ENABLE([legacy-ft2232_highspeed],
+  AS_HELP_STRING([--enable-legacy-ft2232_highspeed], [(HITOOL) Enable building support for  FT2232H/FT4232HS with FTD2XX or libftdi]),
+  [build_ft2232_highspeed=yes], [build_ft2232_highspeed=no]) 
+  
 AC_ARG_ENABLE([jtag_vpi],
   AS_HELP_STRING([--enable-jtag_vpi], [Enable building support for JTAG VPI]),
   [build_jtag_vpi=$enableval], [build_jtag_vpi=no])
@@ -536,6 +548,25 @@ AS_IF([test "x$parport_use_giveio" = "xyes"], [
   AC_DEFINE([PARPORT_USE_GIVEIO], [0], [0 if you don't want parport to use giveio.])
 ])
 
+
+AS_IF([test "x$build_ft2232_libftdi" = "xyes"], [
+  AC_DEFINE([BUILD_FT2232_LIBFTDI], [1], [1 if you want libftdi ft2232.])
+], [
+  AC_DEFINE([BUILD_FT2232_LIBFTDI], [0], [0 if you don't want libftdi ft2232.])
+])
+
+AS_IF([test "x$build_ft2232_ftd2xx" = "xyes"], [
+  AC_DEFINE([BUILD_FT2232_FTD2XX], [1], [1 if you want ftd2xx ft2232.])
+], [
+  AC_DEFINE([BUILD_FT2232_FTD2XX], [0], [0 if you don't want ftd2xx ft2232.])
+])
+
+AS_IF([test "x$build_ft2232_highspeed" = "xyes"], [
+  AC_DEFINE([BUILD_FT2232_HIGHSPEED], [1], [1 if you want support FT2232H/FT4232HS with FTD2XX or libftdi.])
+], [
+  AC_DEFINE([BUILD_FT2232_HIGHSPEED], [0], [0 if you don't want support FT2232H/FT4232HS with FTD2XX or libftdi.])
+])
+
 AS_IF([test "x$build_jtag_vpi" = "xyes"], [
   AC_DEFINE([BUILD_JTAG_VPI], [1], [1 if you want JTAG VPI.])
 ], [
@@ -737,6 +768,8 @@ AM_CONDITIONAL([AT91RM9200], [test "x$build_at91rm9200" = "xyes"])
 AM_CONDITIONAL([BCM2835GPIO], [test "x$build_bcm2835gpio" = "xyes"])
 AM_CONDITIONAL([IMX_GPIO], [test "x$build_imx_gpio" = "xyes"])
 AM_CONDITIONAL([AM335XGPIO], [test "x$build_am335xgpio" = "xyes"])
+AM_CONDITIONAL([FT2232_LIBFTDI], [test "x$build_ft2232_libftdi" = "xyes"])
+AM_CONDITIONAL([FT2232_DRIVER], [test "x$build_ft2232_ftd2xx" = "xyes" -o "$build_ft2232_libftdi" = "xyes"])
 AM_CONDITIONAL([BITBANG], [test "x$build_bitbang" = "xyes"])
 AM_CONDITIONAL([JTAG_VPI], [test "x$build_jtag_vpi" = "xyes"])
 AM_CONDITIONAL([VDEBUG], [test "x$build_vdebug" = "xyes"])

@@ -11,7 +11,7 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
-
+#include "chiptype.h"
 #include "configuration.h"
 #include "log.h"
 #include "command.h"
@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #if IS_DARWIN
 #include <libproc.h>
 #endif
@@ -44,6 +45,8 @@ static const struct option long_options[] = {
 	{"search",		required_argument,		0,				's'},
 	{"log_output",	required_argument,		0,				'l'},
 	{"command",		required_argument,		0,				'c'},
+	{"bin",			required_argument,		0,				'b'},
+	{"chip_param",			required_argument,		0,				'p'},
 	{0, 0, 0, 0}
 };
 
@@ -262,6 +265,67 @@ static void add_default_dirs(void)
 	free(bin2data);
 }
 
+void get_bin_name(const char* str, char* chip, size_t size) {
+    // Define the start and end substrings
+	int len = strlen(str);
+	if (!str) {
+		return;
+	}
+	memcpy(chip, str, len);
+	chip[len] = '\0';
+    return;
+}
+
+char* extract_chip(const char* str, char* chip, size_t size) {
+    // Define the start and end substrings
+    const char* start_substr = "target\\";
+	const char* start_substr2 = "target/CHIP-MCU/";
+    const char* end_substr1 = "-swd.cfg";
+    const char* end_substr2 = "-jtag.cfg";
+    char *found_start, *found_end;
+    // Find the start substring
+	char* start_substr_index = start_substr;
+    found_start = strstr(str, start_substr);
+	if (!found_start) {
+        found_start = strstr(str, start_substr2);
+		start_substr_index = start_substr2;
+    }
+    if (found_start) {
+        // Skip the start substring
+        found_start += strlen(start_substr_index);
+        // Find the end substring
+        found_end = strstr(found_start, end_substr1);
+        if (!found_end) {
+            // If -swd.cfg is not found, try to find -jtage.cfg
+            found_end = strstr(found_start, end_substr2);
+        }
+
+        if (found_end) {
+            // Calculate the length of the extracted chip string
+            size_t len = found_end - found_start;
+
+            // Check if the chip string fits in the provided array
+            if (len + 1 <= size) {
+                // Copy the chip string to the provided array
+                strncpy(chip, found_start, len);
+                chip[len] = '\0';
+                return chip;
+            }
+        }
+    }
+    return NULL;
+}
+
+void get_chip_param(const char* str, char* chip) {
+	int len = strlen(str);
+	if (!str) {
+		return;
+	}
+	memcpy(chip, str, len);
+	chip[len] = '\0';
+    return;
+}
+
 int parse_cmdline_args(struct command_context *cmd_ctx, int argc, char *argv[])
 {
 	int c;
@@ -270,7 +334,7 @@ int parse_cmdline_args(struct command_context *cmd_ctx, int argc, char *argv[])
 		/* getopt_long stores the option index here. */
 		int option_index = 0;
 
-		c = getopt_long(argc, argv, "hvd::l:f:s:c:", long_options, &option_index);
+		c = getopt_long(argc, argv, "hvd::l:f:s:c:b:p:", long_options, &option_index);
 
 		/* Detect the end of the options. */
 		if (c == -1)
@@ -282,11 +346,20 @@ int parse_cmdline_args(struct command_context *cmd_ctx, int argc, char *argv[])
 			case 'h':		/* --help | -h */
 				help_flag = 1;
 				break;
+			case 'b':
+				get_bin_name(optarg, bin_name, sizeof(bin_name));
+				break;
+			case 'p':
+				get_chip_param(optarg, chip_param_file_name);
+				break;
 			case 'v':		/* --version | -v */
 				version_flag = 1;
 				break;
 			case 'f':		/* --file | -f */
 			{
+				if (extract_chip(optarg, chip_type, sizeof(chip_type))) {
+					printf("Extracted chiptype: %s\n", chip_type);
+				}
 				char *command = alloc_printf("script {%s}", optarg);
 				add_config_command(command);
 				free(command);

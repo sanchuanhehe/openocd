@@ -687,7 +687,7 @@ int semihosting_common(struct target *target)
 						return retval;
 					semihosting->result = 0;
 
-					retval = semihosting_write_fields(target, 2, fields);
+					retval = target_write_buffer(target, size, 4, &len);
 					if (retval != ERROR_OK)
 						return retval;
 				}

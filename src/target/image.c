@@ -34,6 +34,8 @@
 	((elf->endianness == ELFDATA2LSB) ? \
 	le_to_h_u32((uint8_t *)&field) : be_to_h_u32((uint8_t *)&field))
 
+#define BINARY_IMAGE_SECTION_SIZE   (0x200000)
+
 #define field64(elf, field) \
 	((elf->endianness == ELFDATA2LSB) ? \
 	le_to_h_u64((uint8_t *)&field) : be_to_h_u64((uint8_t *)&field))
@@ -969,11 +971,22 @@ int image_open(struct image *image, const char *url, const char *type_string)
 			return retval;
 		}
 
-		image->num_sections = 1;
-		image->sections = malloc(sizeof(struct imagesection));
-		image->sections[0].base_address = 0x0;
-		image->sections[0].size = filesize;
-		image->sections[0].flags = 0;
+		image->num_sections = (filesize + BINARY_IMAGE_SECTION_SIZE - 1) / BINARY_IMAGE_SECTION_SIZE;
+		if (image->num_sections < 1) {
+			fileio_close(image_binary->fileio);
+			return ERROR_FAIL;
+		}
+		image->sections = malloc(image->num_sections * sizeof(struct imagesection));
+        unsigned int i;
+		unsigned int num_sections = image->num_sections - 1;
+		for (i = 0; i < num_sections; i++) {
+			image->sections[i].base_address = i * BINARY_IMAGE_SECTION_SIZE;
+			image->sections[i].size = BINARY_IMAGE_SECTION_SIZE;
+			image->sections[i].flags = 0;
+        }
+		image->sections[i].base_address = i * BINARY_IMAGE_SECTION_SIZE;
+		image->sections[i].size = filesize - image->sections[i].base_address;
+		image->sections[i].flags = 0;		
 	} else if (image->type == IMAGE_IHEX) {
 		struct image_ihex *image_ihex;
 
@@ -1085,11 +1098,11 @@ int image_read_section(struct image *image,
 		struct image_binary *image_binary = image->type_private;
 
 		/* only one section in a plain binary */
-		if (section != 0)
-			return ERROR_COMMAND_SYNTAX_ERROR;
+		//if (section != 0)
+		//	return ERROR_COMMAND_SYNTAX_ERROR;
 
 		/* seek to offset */
-		retval = fileio_seek(image_binary->fileio, offset);
+		retval = fileio_seek(image_binary->fileio, section * BINARY_IMAGE_SECTION_SIZE);
 		if (retval != ERROR_OK)
 			return retval;
 

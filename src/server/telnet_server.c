@@ -772,6 +772,8 @@ static int telnet_input(struct connection *connection)
 				} else {
 					if (isprint(*buf_p)) {	/* printable character */
 						telnet_insert(connection, buf_p, 1);
+					} else if ((*buf_p >= 0x80) && (*buf_p <= 0xFE)) {
+						telnet_insert(connection, buf_p, 1);
 					} else { /* non-printable */
 						if (*buf_p == 0x1b) {	/* escape */
 							t_con->state = TELNET_STATE_ESCAPE;

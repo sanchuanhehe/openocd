@@ -803,6 +803,9 @@ static int svf_copy_hexstring_to_binary(char *str, uint8_t **bin, int orig_bit_l
 				} else if ((ch >= 'A') && (ch <= 'F')) {
 					ch = ch - 'A' + 10;
 					break;
+				} else if ((ch >= 'a') && (ch <= 'f')) {
+					ch = ch - 'a' + 10;
+					break;
 				} else {
 					LOG_ERROR("invalid hex string");
 					return ERROR_FAIL;
@@ -1539,6 +1542,273 @@ xxr_common:
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(handle_state_command)
+{
+    char  svf_command_str[1024]= {0};
+    int ret = ERROR_OK;
+    strcat(svf_command_str,"STATE ");
+    for(unsigned int argnum =0; argnum < CMD_ARGC; argnum++){
+	  	strcat(svf_command_str,CMD_ARGV[argnum]);
+	  	strcat(svf_command_str," ");
+	}
+
+	if (ERROR_OK != svf_run_command(CMD_CTX, svf_command_str)) {
+		LOG_ERROR("fail to run command %s", svf_command_str);
+		ret = ERROR_FAIL;
+	}
+	return ret;
+}
+
+COMMAND_HANDLER(handle_frequency_command)
+{
+    char  svf_command_str[1024]= {0};
+    int ret = ERROR_OK;
+    strcat(svf_command_str,"FREQUENCY ");
+    for(unsigned int argnum =0; argnum < CMD_ARGC; argnum++){
+	  	strcat(svf_command_str,CMD_ARGV[argnum]);
+	  	strcat(svf_command_str," ");
+	}
+
+	if (ERROR_OK != svf_run_command(CMD_CTX, svf_command_str)) {
+		LOG_ERROR("fail to run command %s", svf_command_str);
+		ret = ERROR_FAIL;
+	}
+	return ret;
+}
+
+COMMAND_HANDLER(handle_runtest_command)
+{
+    char  svf_command_str[1024]= {0};
+    int ret = ERROR_OK;
+    strcat(svf_command_str,"RUNTEST ");
+    for(unsigned int argnum =0; argnum < CMD_ARGC; argnum++){
+	  	strcat(svf_command_str,CMD_ARGV[argnum]);
+	  	strcat(svf_command_str," ");
+	}
+
+	if (ERROR_OK != svf_run_command(CMD_CTX, svf_command_str)) {
+		LOG_ERROR("fail to run command %s", svf_command_str);
+		ret = ERROR_FAIL;
+	}
+	return ret;
+}
+
+COMMAND_HANDLER(handle_sdr_command)
+{
+	int ret = ERROR_OK;
+	long long time_measure_ms;
+	int time_measure_s, time_measure_m;
+
+	/* parse command line */
+	svf_quiet = 0;
+	svf_nil = 0;
+	svf_ignore_error = 0;
+
+	/* get time */
+	time_measure_ms = timeval_ms();
+
+	/* init */
+	svf_line_number = 1;
+	svf_command_buffer_size = 0;
+
+	svf_check_tdo_para_index = 0;
+	svf_check_tdo_para = malloc(sizeof(struct svf_check_tdo_para) * SVF_CHECK_TDO_PARA_SIZE);
+	if (NULL == svf_check_tdo_para) {
+		LOG_ERROR("not enough memory");
+		ret = ERROR_FAIL;
+		goto free_all;
+	}
+
+	svf_buffer_index = 0;
+	/* double the buffer size */
+	/* in case current command cannot be committed, and next command is a bit scan command */
+	/* here is 32K bits for this big scan command, it should be enough */
+	/* buffer will be reallocated if buffer size is not enough */
+	if (svf_realloc_buffers(2 * SVF_MAX_BUFFER_SIZE_TO_COMMIT) != ERROR_OK) {
+		ret = ERROR_FAIL;
+		goto free_all;
+	}
+
+	memcpy(&svf_para, &svf_para_init, sizeof(svf_para));
+
+	svf_command_buffer_size = 4;
+    for(unsigned int argnum =0; argnum < CMD_ARGC; argnum++){
+       svf_command_buffer_size += strlen(CMD_ARGV[argnum]) +1;     
+	}
+   svf_command_buffer = malloc(svf_command_buffer_size);
+	memset(svf_command_buffer, 0, svf_command_buffer_size);
+	strcat(svf_command_buffer,"SDR");
+   for(unsigned int argnum =0; argnum < CMD_ARGC; argnum++){
+	   strcat(svf_command_buffer," ");
+	  	strcat(svf_command_buffer,CMD_ARGV[argnum]);
+	}
+		
+	/* Run Command */
+	if (ERROR_OK != svf_run_command(CMD_CTX, svf_command_buffer)) {
+		LOG_ERROR("fail to run command %s", svf_command_buffer);
+		ret = ERROR_FAIL;
+	}
+
+	/* print time */
+	time_measure_ms = timeval_ms() - time_measure_ms;
+	time_measure_s = time_measure_ms / 1000;
+	time_measure_ms %= 1000;
+	time_measure_m = time_measure_s / 60;
+	time_measure_s %= 60;
+	if (time_measure_ms < 1000)
+		command_print(CMD,
+			"\r\nTime used: %dm%ds%lldms ",
+			time_measure_m,
+			time_measure_s,
+			time_measure_ms);
+
+free_all:
+
+	/* free buffers */
+	if (svf_command_buffer) {
+		free(svf_command_buffer);
+		svf_command_buffer = NULL;
+		svf_command_buffer_size = 0;
+	}
+	if (svf_check_tdo_para) {
+		free(svf_check_tdo_para);
+		svf_check_tdo_para = NULL;
+		svf_check_tdo_para_index = 0;
+	}
+	if (svf_tdi_buffer) {
+		free(svf_tdi_buffer);
+		svf_tdi_buffer = NULL;
+	}
+	if (svf_tdo_buffer) {
+		free(svf_tdo_buffer);
+		svf_tdo_buffer = NULL;
+	}
+	if (svf_mask_buffer) {
+		free(svf_mask_buffer);
+		svf_mask_buffer = NULL;
+	}
+	svf_buffer_index = 0;
+	svf_buffer_size = 0;
+
+	svf_free_xxd_para(&svf_para.hdr_para);
+	svf_free_xxd_para(&svf_para.hir_para);
+	svf_free_xxd_para(&svf_para.tdr_para);
+	svf_free_xxd_para(&svf_para.tir_para);
+	svf_free_xxd_para(&svf_para.sdr_para);
+	svf_free_xxd_para(&svf_para.sir_para);
+
+	svf_ignore_error = 0;
+	return ret;
+}
+
+COMMAND_HANDLER(handle_sir_command)
+{
+	int ret = ERROR_OK;
+	long long time_measure_ms;
+	int time_measure_s, time_measure_m;
+
+	/* parse command line */
+	svf_quiet = 0;
+	svf_nil = 0;
+	svf_ignore_error = 0;
+
+	/* get time */
+	time_measure_ms = timeval_ms();
+
+	/* init */
+	svf_line_number = 1;
+	svf_command_buffer_size = 0;
+
+	svf_check_tdo_para_index = 0;
+	svf_check_tdo_para = malloc(sizeof(struct svf_check_tdo_para) * SVF_CHECK_TDO_PARA_SIZE);
+	if (NULL == svf_check_tdo_para) {
+		LOG_ERROR("not enough memory");
+		ret = ERROR_FAIL;
+		goto free_all;
+	}
+
+	svf_buffer_index = 0;
+	/* double the buffer size */
+	/* in case current command cannot be committed, and next command is a bit scan command */
+	/* here is 32K bits for this big scan command, it should be enough */
+	/* buffer will be reallocated if buffer size is not enough */
+	if (svf_realloc_buffers(2 * SVF_MAX_BUFFER_SIZE_TO_COMMIT) != ERROR_OK) {
+		ret = ERROR_FAIL;
+		goto free_all;
+	}
+
+	memcpy(&svf_para, &svf_para_init, sizeof(svf_para));
+
+	svf_command_buffer_size = 4;
+    for(unsigned int argnum =0; argnum < CMD_ARGC; argnum++){
+       svf_command_buffer_size += strlen(CMD_ARGV[argnum]) +1;     
+	}
+   svf_command_buffer = malloc(svf_command_buffer_size);
+	memset(svf_command_buffer, 0, svf_command_buffer_size);
+	strcat(svf_command_buffer,"SIR");
+   for(unsigned int argnum =0; argnum < CMD_ARGC; argnum++){
+	   strcat(svf_command_buffer," ");
+	  	strcat(svf_command_buffer,CMD_ARGV[argnum]);
+	}
+		
+	/* Run Command */
+	if (ERROR_OK != svf_run_command(CMD_CTX, svf_command_buffer)) {
+		LOG_ERROR("fail to run command %s", svf_command_buffer);
+		ret = ERROR_FAIL;
+	}
+
+	/* print time */
+	time_measure_ms = timeval_ms() - time_measure_ms;
+	time_measure_s = time_measure_ms / 1000;
+	time_measure_ms %= 1000;
+	time_measure_m = time_measure_s / 60;
+	time_measure_s %= 60;
+	if (time_measure_ms < 1000)
+		command_print(CMD,
+			"\r\nTime used: %dm%ds%lldms ",
+			time_measure_m,
+			time_measure_s,
+			time_measure_ms);
+
+free_all:
+
+	/* free buffers */
+	if (svf_command_buffer) {
+		free(svf_command_buffer);
+		svf_command_buffer = NULL;
+		svf_command_buffer_size = 0;
+	}
+	if (svf_check_tdo_para) {
+		free(svf_check_tdo_para);
+		svf_check_tdo_para = NULL;
+		svf_check_tdo_para_index = 0;
+	}
+	if (svf_tdi_buffer) {
+		free(svf_tdi_buffer);
+		svf_tdi_buffer = NULL;
+	}
+	if (svf_tdo_buffer) {
+		free(svf_tdo_buffer);
+		svf_tdo_buffer = NULL;
+	}
+	if (svf_mask_buffer) {
+		free(svf_mask_buffer);
+		svf_mask_buffer = NULL;
+	}
+	svf_buffer_index = 0;
+	svf_buffer_size = 0;
+
+	svf_free_xxd_para(&svf_para.hdr_para);
+	svf_free_xxd_para(&svf_para.hir_para);
+	svf_free_xxd_para(&svf_para.tdr_para);
+	svf_free_xxd_para(&svf_para.tir_para);
+	svf_free_xxd_para(&svf_para.sdr_para);
+	svf_free_xxd_para(&svf_para.sir_para);
+
+	svf_ignore_error = 0;
+	return ret;
+}
+
 static const struct command_registration svf_command_handlers[] = {
 	{
 		.name = "svf",
@@ -1547,6 +1817,41 @@ static const struct command_registration svf_command_handlers[] = {
 		.help = "Runs a SVF file.",
 		.usage = "[-tap device.tap] <file> [quiet] [nil] [progress] [ignore_error]",
 	},
+	{
+		.name = "FREQUENCY",
+		.handler = handle_frequency_command,
+		.mode = COMMAND_EXEC,
+		.help = "Runs FREQUENCY of SVF instruction.",
+		.usage = "FREQUENCY  [frequency] [unit]",
+	},
+	{
+		.name = "STATE",
+		.handler = handle_state_command,
+		.mode = COMMAND_EXEC,
+		.help = "Runs STATE of SVF instruction.",
+		.usage = "STATE  <state>",
+	},	
+	{
+		.name = "SDR",
+		.handler = handle_sdr_command,
+		.mode = COMMAND_EXEC,
+		.help = "Runs sdr of SVF instruction.",
+		.usage = "SDR  <bit num> TDI (<input>) TDO (<output>) MASK (<mask>)",
+	},
+	{
+		.name = "SIR",
+		.handler = handle_sir_command,
+		.mode = COMMAND_EXEC,
+		.help = "Runs sir of SVF instruction.",
+		.usage = "SIR  <bit num> TDI (<input>) TDO (<output>) MASK (<mask>)",
+	},
+	{
+		.name = "RUNTEST",
+		.handler = handle_runtest_command,
+		.mode = COMMAND_EXEC,
+		.help = "Runs sir of SVF instruction.",
+		.usage = "RUNTEST IDLE <clock> TCK",
+	},	
 	COMMAND_REGISTRATION_DONE
 };
 

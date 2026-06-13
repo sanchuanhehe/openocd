@@ -223,6 +223,8 @@ static int aarch64_init_debug_access(struct target *target)
 	 */
 
 	/* Enable CTI */
+	armv8->cti->ap->dap = armv8->debug_ap->dap;
+   	armv8->cti->ap->memaccess_tck = armv8->debug_ap->memaccess_tck;
 	retval = arm_cti_enable(armv8->cti, true);
 	/* By default, gate all channel events to and from the CTM */
 	if (retval == ERROR_OK)
@@ -2446,19 +2448,30 @@ static int aarch64_read_memory(struct target *target, target_addr_t address,
 {
 	int mmu_enabled = 0;
 	int retval;
+	
+	struct armv8_common *armv8a = target_to_armv8(target);
+	struct adiv5_dap *swjdp = armv8a->arm.dap;
+	uint8_t apsel = swjdp->apsel;
 
 	/* determine if MMU was enabled on target stop */
-	retval = aarch64_mmu(target, &mmu_enabled);
-	if (retval != ERROR_OK)
-		return retval;
+	if (apsel == armv8a->debug_ap->ap_num) {
+		/* determine if MMU was enabled on target stop */
+        retval = aarch64_mmu(target, &mmu_enabled);
+        if (retval != ERROR_OK)
+            return retval;
 
-	if (mmu_enabled) {
-		/* enable MMU as we could have disabled it for phys access */
-		retval = aarch64_mmu_modify(target, 1);
-		if (retval != ERROR_OK)
-			return retval;
+		if (mmu_enabled) {
+			/* enable MMU as we could have disabled it for phys access */
+			retval = aarch64_mmu_modify(target, 1);
+			if (retval != ERROR_OK)
+				return retval;
+		}
+		retval = aarch64_read_cpu_memory(target, address, size, count, buffer);
+	} else {
+		retval = mem_ap_read_buf(&(swjdp->ap[apsel]), buffer, size, count, address);
 	}
-	return aarch64_read_cpu_memory(target, address, size, count, buffer);
+
+	return retval;
 }
 
 static int aarch64_write_phys_memory(struct target *target,
@@ -2484,18 +2497,28 @@ static int aarch64_write_memory(struct target *target, target_addr_t address,
 	int mmu_enabled = 0;
 	int retval;
 
-	/* determine if MMU was enabled on target stop */
-	retval = aarch64_mmu(target, &mmu_enabled);
-	if (retval != ERROR_OK)
-		return retval;
+	struct armv8_common *armv8a = target_to_armv8(target);
+	struct adiv5_dap *swjdp = armv8a->arm.dap;
+	uint8_t apsel = swjdp->apsel;
 
-	if (mmu_enabled) {
-		/* enable MMU as we could have disabled it for phys access */
-		retval = aarch64_mmu_modify(target, 1);
-		if (retval != ERROR_OK)
-			return retval;
-	}
-	return aarch64_write_cpu_memory(target, address, size, count, buffer);
+	/* determine if MMU was enabled on target stop */
+
+	if (apsel == armv8a->debug_ap->ap_num) {
+		/* determine if MMU was enabled on target stop */
+        retval = aarch64_mmu(target, &mmu_enabled);
+        if (retval != ERROR_OK)
+            return retval;
+
+		if (mmu_enabled) {
+			/* enable MMU as we could have disabled it for phys access */
+			retval = aarch64_mmu_modify(target, 1);
+			if (retval != ERROR_OK)
+				return retval;
+		}
+		retval = aarch64_write_cpu_memory(target, address, size, count, buffer);
+	} else
+		retval = mem_ap_write_buf(&(swjdp->ap[apsel]), buffer, size, count, address);
+	return retval;
 }
 
 static int aarch64_handle_target_request(void *priv)
@@ -2549,7 +2572,7 @@ static int aarch64_examine_first(struct target *target)
 	if (!armv8->debug_ap) {
 		if (pc->adiv5_config.ap_num == DP_APSEL_INVALID) {
 			/* Search for the APB-AB */
-			retval = dap_find_get_ap(swjdp, AP_TYPE_APB_AP, &armv8->debug_ap);
+			retval = dap_find_ap(swjdp, AP_TYPE_APB_AP, &armv8->debug_ap);
 			if (retval != ERROR_OK) {
 				LOG_ERROR("Could not find APB-AP for debug access");
 				return retval;
@@ -2669,6 +2692,8 @@ static int aarch64_examine_first(struct target *target)
 
 	LOG_DEBUG("Configured %i hw breakpoints, %i watchpoints",
 		aarch64->brp_num, aarch64->wp_num);
+	/*config ap value*/
+	swjdp->apsel = target->ap_sel;
 
 	target->state = TARGET_UNKNOWN;
 	target->debug_reason = DBG_REASON_NOTHALTED;

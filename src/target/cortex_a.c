@@ -2702,14 +2702,21 @@ static int cortex_a_read_memory(struct target *target, target_addr_t address,
 	uint32_t size, uint32_t count, uint8_t *buffer)
 {
 	int retval;
+	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
+	struct armv7a_common *armv7a = &cortex_a->armv7a_common;
+	struct adiv5_dap *swjdp = armv7a->arm.dap;
 
 	/* cortex_a handles unaligned memory access */
 	LOG_DEBUG("Reading memory at address " TARGET_ADDR_FMT "; size %" PRIu32 "; count %" PRIu32,
 		address, size, count);
-
-	cortex_a_prep_memaccess(target, 0);
-	retval = cortex_a_read_cpu_memory(target, address, size, count, buffer);
-	cortex_a_post_memaccess(target, 0);
+		
+    if (swjdp->apsel == armv7a->debug_ap->ap_num) {
+	    cortex_a_prep_memaccess(target, 0);
+	    retval = cortex_a_read_cpu_memory(target, address, size, count, buffer);
+	    cortex_a_post_memaccess(target, 0);
+    } else {
+        retval = mem_ap_read_buf(&(swjdp->ap[swjdp->apsel]), buffer, size, count, address);
+    }
 
 	return retval;
 }
@@ -2738,17 +2745,24 @@ static int cortex_a_write_memory(struct target *target, target_addr_t address,
 	uint32_t size, uint32_t count, const uint8_t *buffer)
 {
 	int retval;
+	
+	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
+	struct armv7a_common *armv7a = &cortex_a->armv7a_common;
+	struct adiv5_dap *swjdp = armv7a->arm.dap;
 
 	/* cortex_a handles unaligned memory access */
 	LOG_DEBUG("Writing memory at address " TARGET_ADDR_FMT "; size %" PRIu32 "; count %" PRIu32,
 		address, size, count);
 
-	/* memory writes bypass the caches, must flush before writing */
-	armv7a_cache_auto_flush_on_write(target, address, size * count);
-
-	cortex_a_prep_memaccess(target, 0);
-	retval = cortex_a_write_cpu_memory(target, address, size, count, buffer);
-	cortex_a_post_memaccess(target, 0);
+    if (swjdp->apsel == armv7a->debug_ap->ap_num) {
+			/* memory writes bypass the caches, must flush before writing */
+	    armv7a_cache_auto_flush_on_write(target, address, size * count);
+		cortex_a_prep_memaccess(target, 0);
+		retval = cortex_a_write_cpu_memory(target, address, size, count, buffer);
+		cortex_a_post_memaccess(target, 0);
+    } else {
+        retval = mem_ap_write_buf(&(swjdp->ap[swjdp->apsel]), buffer, size, count, address);
+    }
 	return retval;
 }
 
@@ -3044,7 +3058,9 @@ static int cortex_a_examine_first(struct target *target)
 	LOG_DEBUG("Configured %i hw watchpoints", cortex_a->wrp_num);
 
 	/* select debug_ap as default */
-	swjdp->apsel = armv7a->debug_ap->ap_num;
+	//swjdp->apsel = armv7a->debug_ap->ap_num;
+	/*config ap value*/
+	swjdp->apsel = target->ap_sel;
 
 	target_set_examined(target);
 	return ERROR_OK;
@@ -3055,7 +3071,10 @@ static int cortex_a_examine(struct target *target)
 	int retval = ERROR_OK;
 
 	/* Reestablish communication after target reset */
-	retval = cortex_a_examine_first(target);
+	
+	if (!target_was_examined(target)) {
+		retval = cortex_a_examine_first(target);
+    }
 
 	/* Configure core debug access */
 	if (retval == ERROR_OK)

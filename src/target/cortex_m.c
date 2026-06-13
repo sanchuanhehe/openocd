@@ -932,7 +932,8 @@ static int cortex_m_poll(struct target *target)
 	if (cortex_m->dcb_dhcsr & S_HALT) {
 		target->state = TARGET_HALTED;
 
-		if ((prev_target_state == TARGET_RUNNING) || (prev_target_state == TARGET_RESET)) {
+		if ((prev_target_state == TARGET_RUNNING) || (prev_target_state == TARGET_RESET) 
+			|| (prev_target_state == TARGET_UNKNOWN)) {
 			retval = cortex_m_debug_entry(target);
 			if (retval != ERROR_OK)
 				return retval;

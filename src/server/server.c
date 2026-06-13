@@ -558,6 +558,10 @@ int server_loop(struct command_context *command_context)
 			/* handle activity on connections */
 			if (service->connections) {
 				struct connection *c;
+#ifdef HISPARK_TRACE_MODIFIES
+				extern int gdb_actual_connections;
+				extern void DAP_Stop_VarMonitor(void);
+#endif /* HISPARK_TRACE_MODIFIES */
 
 				for (c = service->connections; c; ) {
 					if ((c->fd >= 0 && FD_ISSET(c->fd, &read_fds)) || c->input_pending) {
@@ -573,6 +577,12 @@ int server_loop(struct command_context *command_context)
 							remove_connection(service, c);
 							LOG_INFO("dropped '%s' connection",
 								service->name);
+#ifdef HISPARK_TRACE_MODIFIES
+							DAP_Stop_VarMonitor();
+							if (service->type == CONNECTION_TCP && gdb_actual_connections == 0) {
+								shutdown_openocd = SHUTDOWN_REQUESTED;
+							}
+#endif /* HISPARK_TRACE_MODIFIES */
 							c = next;
 							continue;
 						}

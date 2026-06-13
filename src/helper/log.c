@@ -395,7 +395,11 @@ char *alloc_printf(const char *format, ...)
  *
  */
 #define KEEP_ALIVE_KICK_TIME_MS  500
-#define KEEP_ALIVE_TIMEOUT_MS   1000
+#ifdef	HISPARK_TRACE_MODIFIES
+	#define KEEP_ALIVE_TIMEOUT_MS   2000
+#else /* HISPARK_TRACE_MODIFIES */
+	#define KEEP_ALIVE_TIMEOUT_MS   1000
+#endif /* HISPARK_TRACE_MODIFIES */
 
 static void gdb_timeout_warning(int64_t delta_time)
 {

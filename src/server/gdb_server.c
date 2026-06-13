@@ -26,7 +26,7 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
-
+#include "chiptype.h"
 #include <target/breakpoints.h>
 #include <target/target_request.h>
 #include <target/register.h>
@@ -40,6 +40,45 @@
 #include <jtag/jtag.h>
 #include "rtos/rtos.h"
 #include "target/smp.h"
+char chip_type[MAX_CHIPNAME_LEN];
+char bin_name[MAX_BINNAME_LEN];
+char chip_param_file_name[MAX_BINNAME_LEN];
+char base_adress[MAX_BINNAME_LEN];
+const char *chip_type_array[] = {
+	"WS63",
+	"NB18-ACORE",
+	"NB18-PCORE",
+	"BS21",
+	"BRANDY",
+	"3067MBPIDM0",
+	"3067MBPIDM1",
+	"3067MBPIDM2",
+	"3066HAPIMM0",
+	"3066HAPIVM0",
+	"3066HAPIDM0",
+	"3066HNPIDM0",
+	"3066HAPIDM1",
+	"3066HNPIDM1",
+	"3066HAPIMM1",
+	"3066HAPIVM1",
+	"3066HAPIMM2",
+	"3066HAPIVM2",
+	"3066HAPIDM2",
+	"3066HNPIDM2",
+	"3066HAPIMM3",
+	"3066HAPIVM3",
+	"3066HAPIDM3",
+	"3066HNPIDM3",
+};
+
+bool is_chip_in_array(const char *string_array[], int array_size, const char *input) {
+    for (int i = 0; i < array_size; i++) {
+        if (strcmp(input, string_array[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /**
  * @file
@@ -103,6 +142,11 @@ struct gdb_connection {
 
 static struct gdb_connection *current_gdb_connection;
 
+#ifdef HISPARK_TRACE_MODIFIES
+static gdb_var_monitor g_gdbVarMonitor;
+static unsigned int g_gdb_varMonitorPacketSize;
+#endif /* HISPARK_TRACE_MODIFIES */
+
 static int gdb_breakpoint_override;
 static enum breakpoint_type gdb_breakpoint_override_type;
 
@@ -118,6 +162,14 @@ static void gdb_sig_halted(struct connection *connection);
 /* number of gdb connections, mainly to suppress gdb related debugging spam
  * in helper/log.c when no gdb connections are actually active */
 int gdb_actual_connections;
+
+#ifdef HISPARK_TRACE_MODIFIES
+static int g_startVarMonitor = 0;
+int g_livewatchOpenFLag = 0;
+int g_pollEnableSwitch = 0;
+extern int g_sendEndFlag;
+extern int g_framingCompatibleFlag;
+#endif /* HISPARK_TRACE_MODIFIES */
 
 /* set if we are sending a memory map to gdb
  * via qXfer:memory-map:read packet */
@@ -1034,7 +1086,14 @@ static int gdb_new_connection(struct connection *connection)
 	if (initial_ack != '+')
 		gdb_putback_char(connection, initial_ack);
 
+#ifdef HISPARK_TRACE_MODIFIES
+	/* When other sessions are connected, the current session does not enter the halt state. */
+	if (!gdb_actual_connections) {
+		target_call_event_callbacks(target, TARGET_EVENT_GDB_ATTACH);
+	}
+#else /* HISPARK_TRACE_MODIFIES */
 	target_call_event_callbacks(target, TARGET_EVENT_GDB_ATTACH);
+#endif /* HISPARK_TRACE_MODIFIES */
 
 	if (target->rtos) {
 		/* clean previous rtos session if supported*/
@@ -1064,7 +1123,6 @@ static int gdb_new_connection(struct connection *connection)
 			}
 		}
 	}
-
 	gdb_actual_connections++;
 	log_printf_lf(all_targets->next ? LOG_LVL_INFO : LOG_LVL_DEBUG,
 			__FILE__, __LINE__, __func__,
@@ -1599,10 +1657,29 @@ static int gdb_write_memory_packet(struct connection *connection,
 		LOG_ERROR("unable to decode memory packet");
 
 	retval = ERROR_NOT_IMPLEMENTED;
+	
+#ifdef HISPARK_TRACE_MODIFIES
+	if (g_startVarMonitor) {
+		retval = cmsis_dap_cmd_DAP_Write_Var(addr, len, buffer);
+		if (g_livewatchOpenFLag == 1) {
+			int64_t ms_end;
+
+			/* delay 200ms. */
+			ms_end = 200 + timeval_ms();
+			while (timeval_ms() < ms_end);
+		}
+	} else {
+		if (target->rtos)
+		retval = rtos_write_buffer(target, addr, len, buffer);
+		if (retval == ERROR_NOT_IMPLEMENTED)
+			retval = target_write_buffer(target, addr, len, buffer);
+	}
+#else /* HISPARK_TRACE_MODIFIES */
 	if (target->rtos)
 		retval = rtos_write_buffer(target, addr, len, buffer);
 	if (retval == ERROR_NOT_IMPLEMENTED)
 		retval = target_write_buffer(target, addr, len, buffer);
+#endif /* HISPARK_TRACE_MODIFIES */
 
 	if (retval == ERROR_OK)
 		gdb_put_packet(connection, "OK", 2);
@@ -1737,9 +1814,14 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 
 	type = strtoul(packet + 1, &separator, 16);
 
-	if (type == 0)	/* memory breakpoint */
-		bp_type = BKPT_SOFT;
-	else if (type == 1)	/* hardware breakpoint */
+	if (type == 0) {	/* memory breakpoint */
+		if (is_chip_in_array(chip_type_array, sizeof(chip_type_array) / sizeof(chip_type_array[0]), chip_type)) {
+			bp_type = BKPT_HARD;
+		} else {
+			bp_type = BKPT_SOFT;
+		}
+	} else if (type == 1)	/* hardware breakpoint */
+		/* Forcibly use hardware breakpoints in hispark_trace. */
 		bp_type = BKPT_HARD;
 	else if (type == 2)	/* write watchpoint */
 		wp_type = WPT_WRITE;
@@ -2740,6 +2822,35 @@ static int gdb_get_thread_list_chunk(struct target *target, char **thread_list,
 	return ERROR_OK;
 }
 
+#ifdef HISPARK_TRACE_MODIFIES
+static int decode_var_monitor(char const *buf, gdb_var_list *var_list, unsigned int num)
+{
+	for (unsigned int i = 0; i < num; i++) {
+		if (buf == NULL) {
+			LOG_INFO("buf = %s", buf);
+			return ERROR_FAIL;
+		}
+		var_list[i].varAddress = strtoull(buf + 1, &buf, 16);
+		var_list[i].varNumBytes = strtoul(buf + 1, &buf, 16);
+		strtoul(buf + 1, &buf, 16);
+	}
+	return ERROR_OK;
+}
+
+void DAP_Stop_VarMonitor(void)
+{
+	cmsis_dap_cmd_DAP_Stop_VarMonitor();
+	/* stop var monitor. */
+	g_startVarMonitor = 0;
+	g_livewatchOpenFLag = 0;
+	g_pollEnableSwitch = 1;
+	/* enable poll */
+	if (g_livewatchOpenFLag == 0) {
+		jtag_poll_set_enabled(true);
+	}
+}
+#endif /* HISPARK_TRACE_MODIFIES */
+
 static int gdb_query_packet(struct connection *connection,
 		char const *packet, int packet_size)
 {
@@ -2965,7 +3076,233 @@ static int gdb_query_packet(struct connection *connection,
 		gdb_connection->noack_mode = 1;
 		gdb_put_packet(connection, "OK", 2);
 		return ERROR_OK;
-	} else if (target->type->gdb_query_custom) {
+	} 
+#ifdef HISPARK_TRACE_MODIFIES
+	else if (strncmp(packet, "qSeggerHSS:Stop", 15) == 0) {
+		LOG_INFO("Stop");
+		DAP_Stop_VarMonitor();
+
+		gdb_put_packet(connection, "OK", 2);
+		return ERROR_OK;
+	} else if (strncmp(packet, "qSeggerHSS:Supported", 20) == 0) {
+		gdb_put_packet(connection, "OK", 2);
+		return ERROR_OK;
+	} else if (strncmp(packet, "qSeggerHSS:Start:", 17) == 0) {
+		char *separator;
+		char timeFlag = 1;
+
+		packet += 17;
+		timeFlag = strtoul(packet, &packet, 16);
+		g_gdbVarMonitor.periodUs = strtoul(packet + 1, &separator, 16);
+		if (timeFlag == 0) {
+			/* If the flag is 0, the unit is ms. */
+			g_gdbVarMonitor.periodUs *= 1000;
+		}
+		/* > 100000us. */
+		if (g_gdbVarMonitor.periodUs >= 100000) {
+            g_livewatchOpenFLag = 1;
+		} else {
+			g_livewatchOpenFLag = 0;
+		}
+		LOG_INFO("g_gdbVarMonitor.periodUs = %d", g_gdbVarMonitor.periodUs);
+		g_gdbVarMonitor.varNum = strtoul(separator + 1, &separator, 16);
+		LOG_INFO("g_gdbVarMonitor.varNum = %d", g_gdbVarMonitor.varNum);
+		g_gdbVarMonitor.varList = (gdb_var_list *)malloc(g_gdbVarMonitor.varNum * sizeof(gdb_var_list));
+		if (g_gdbVarMonitor.varList == NULL) {
+			gdb_send_error(connection, 01);
+			return ERROR_FAIL;
+		}
+		decode_var_monitor(separator, g_gdbVarMonitor.varList, g_gdbVarMonitor.varNum);
+
+		unsigned int *varAddress_buf = (unsigned int *)malloc(g_gdbVarMonitor.varNum * sizeof(unsigned int));
+		if (varAddress_buf == NULL) {
+			free(g_gdbVarMonitor.varList);
+			g_gdbVarMonitor.varList = NULL;
+			gdb_send_error(connection, 01);
+			return ERROR_FAIL;
+		}
+		unsigned int *varNumBytes_buf = (unsigned int *)malloc(g_gdbVarMonitor.varNum * sizeof(unsigned int));
+		if (varNumBytes_buf == NULL) {
+			free(varAddress_buf);
+			varAddress_buf = NULL;
+			free(g_gdbVarMonitor.varList);
+			g_gdbVarMonitor.varList = NULL;
+			gdb_send_error(connection, 01);
+			return ERROR_FAIL;
+		}
+		for (unsigned int i = 0; i < g_gdbVarMonitor.varNum; i++) {
+			(varAddress_buf[i]) = g_gdbVarMonitor.varList[i].varAddress;
+			(varNumBytes_buf[i]) = g_gdbVarMonitor.varList[i].varNumBytes;
+			LOG_INFO("address : %x, size : %x", varAddress_buf[i], varNumBytes_buf[i]);
+		}
+		cmsis_dap_cmd_DAP_Var_Monitor(g_gdbVarMonitor.periodUs, g_gdbVarMonitor.varNum, varAddress_buf, varNumBytes_buf);
+		g_sendEndFlag = 1;
+
+		/* Calculate the memory to be applied for, Timestamp 4-bytes. */
+		g_gdb_varMonitorPacketSize = 4;
+		for (unsigned int i = 0; i < g_gdbVarMonitor.varNum; i++) {
+			g_gdb_varMonitorPacketSize += g_gdbVarMonitor.varList[i].varNumBytes;
+		}
+
+		free(varAddress_buf);
+		varAddress_buf = NULL;
+		free(varNumBytes_buf);
+		varNumBytes_buf = NULL;
+		free(g_gdbVarMonitor.varList);
+		g_gdbVarMonitor.varList = NULL;
+
+		/* start var monitor. */
+		g_startVarMonitor = 1;
+		g_pollEnableSwitch = 0;
+		/* disable poll */
+		if (g_livewatchOpenFLag == 0) {
+		    jtag_poll_set_enabled(false);
+		}
+		gdb_put_packet(connection, "OK", 2);
+		return ERROR_OK;
+	} else if (strncmp(packet, "qSeggerHSS:CfgAP:", 17) == 0) {
+		packet += 17;
+		unsigned int ahbChannelFlag = strtoul(packet, &packet, 16);
+		LOG_INFO("ahbChannelFlag = %d", ahbChannelFlag);
+		if (cmsis_dap_cmd_DAP_Var_Config(ahbChannelFlag) != ERROR_OK) {
+			gdb_put_packet(connection, "", 2);
+			return ERROR_FAIL;
+		}
+		gdb_put_packet(connection, "OK", 2);
+		return ERROR_OK;
+	} else if (strncmp(packet, "qSeggerHSS:Read:", 16) == 0) {
+		char *hex_buffer;
+		size_t pkt_len;
+		char pktBuffer[20];
+		char retNumOfResponseData[4];
+		unsigned int numOfResponseData;
+		unsigned int actualTotalSamplingTimes = 0;
+		unsigned int hex_buffer_size = g_gdb_varMonitorPacketSize;
+		int retval = ERROR_OK;
+		unsigned int usbMaxTransferFrames;
+		unsigned int usbLastTransferFrames;
+
+		/* Maximum USB transmission capability = 512-bytes - 8-bytes */
+		if (g_framingCompatibleFlag) {
+			usbMaxTransferFrames = (512 - 8) / g_gdb_varMonitorPacketSize;
+		} else {
+			usbMaxTransferFrames = (512 - 8);
+		}
+
+		packet += 16;
+		g_gdbVarMonitor.maxSampleTimes = strtoul(packet, NULL, 16);
+		uint8_t *readVarBuffer = (uint8_t *)malloc(g_gdb_varMonitorPacketSize * g_gdbVarMonitor.maxSampleTimes);
+		if (readVarBuffer == NULL) {
+			gdb_send_error(connection, 01);
+			return ERROR_FAIL;
+		}
+		/* A maximum of 100 frames can be received at a time:(512 - 8) / g_gdb_varMonitorPacketSize */
+		if (g_framingCompatibleFlag) {
+			g_gdbVarMonitor.maxSampleTimes -= (512 - 8) / g_gdb_varMonitorPacketSize;
+		} else {
+			g_gdbVarMonitor.maxSampleTimes = g_gdbVarMonitor.maxSampleTimes * g_gdb_varMonitorPacketSize / usbMaxTransferFrames;
+			usbLastTransferFrames = g_gdbVarMonitor.maxSampleTimes * g_gdb_varMonitorPacketSize % usbMaxTransferFrames;
+			if (usbLastTransferFrames) {
+				g_gdbVarMonitor.maxSampleTimes++;
+			}
+		}
+
+		do {
+			if (g_framingCompatibleFlag) {
+				uint8_t *buffer;
+				retval = cmsis_dap_cmd_DAP_Read_Var(usbMaxTransferFrames, retNumOfResponseData, &buffer);
+				if (retval) {
+					LOG_INFO("retval = %d", retval);
+					break;
+				}
+				unsigned int actualOneOfSamplingTimes = (retNumOfResponseData[3] & 0xff)             |
+														((retNumOfResponseData[2] << 8) & 0xff00)    |
+														((retNumOfResponseData[1] << 16) & 0xff0000) |
+														((retNumOfResponseData[0] << 24) & 0xff000000);
+	
+				/* Prevent array overflow */
+				if (actualOneOfSamplingTimes < usbMaxTransferFrames) {
+					memcpy(readVarBuffer + actualTotalSamplingTimes * g_gdb_varMonitorPacketSize, buffer, actualOneOfSamplingTimes * g_gdb_varMonitorPacketSize);
+					actualTotalSamplingTimes += actualOneOfSamplingTimes;
+					break;
+				}
+				memcpy(readVarBuffer + actualTotalSamplingTimes * g_gdb_varMonitorPacketSize, buffer, actualOneOfSamplingTimes * g_gdb_varMonitorPacketSize);
+				actualTotalSamplingTimes += actualOneOfSamplingTimes;
+			} else {
+				uint8_t *buffer;
+				if (actualTotalSamplingTimes != (g_gdbVarMonitor.maxSampleTimes - 1) ||
+					usbLastTransferFrames == 0) {
+					retval = cmsis_dap_cmd_DAP_Read_Var(usbMaxTransferFrames, retNumOfResponseData, &buffer);
+				} else {
+					retval = cmsis_dap_cmd_DAP_Read_Var(usbLastTransferFrames, retNumOfResponseData, &buffer);
+				}
+				if (retval) {
+					LOG_INFO("retval = %d", retval);
+					break;
+				}
+				numOfResponseData = (retNumOfResponseData[3] & 0xff)             |
+									((retNumOfResponseData[2] << 8) & 0xff00)    |
+									((retNumOfResponseData[1] << 16) & 0xff0000) |
+									((retNumOfResponseData[0] << 24) & 0xff000000);
+
+				/* Prevent array overflow */
+				if (numOfResponseData < usbMaxTransferFrames) {
+					memcpy(readVarBuffer + actualTotalSamplingTimes * usbMaxTransferFrames, buffer, numOfResponseData);
+					actualTotalSamplingTimes++;
+					break;
+				}
+				memcpy(readVarBuffer + actualTotalSamplingTimes * usbMaxTransferFrames, buffer, numOfResponseData);
+				actualTotalSamplingTimes++;
+			}
+		} while (actualTotalSamplingTimes < g_gdbVarMonitor.maxSampleTimes);
+
+		if (retval == ERROR_FAIL) {
+			strcpy(pktBuffer, "FAIL,00000000");
+			gdb_put_packet(connection, pktBuffer, strlen(pktBuffer));
+
+			free(readVarBuffer);
+			readVarBuffer = NULL;
+
+			return retval;
+		}
+
+		if (g_framingCompatibleFlag == 0) {
+			if (actualTotalSamplingTimes) {
+				actualTotalSamplingTimes = ((actualTotalSamplingTimes - 1) * usbMaxTransferFrames + numOfResponseData) / g_gdb_varMonitorPacketSize;
+			}
+		}
+		retNumOfResponseData[3] = (actualTotalSamplingTimes & 0xff);
+		retNumOfResponseData[2] = (actualTotalSamplingTimes & 0xff00) >> 8;
+		retNumOfResponseData[1] = (actualTotalSamplingTimes & 0xff0000) >> 16;
+		retNumOfResponseData[0] = (actualTotalSamplingTimes & 0xff000000) >> 24;
+
+		hex_buffer = malloc(4 * 2 + 1);
+		if (hex_buffer == NULL) {
+			free(readVarBuffer);
+			readVarBuffer = NULL;
+			gdb_send_error(connection, 01);
+			return ERROR_FAIL;
+		}
+		pkt_len = hexify(hex_buffer, retNumOfResponseData, 4, 4 * 2 + 1);
+		pkt_len = snprintf(pktBuffer, 3 + pkt_len + 1, "OK,%s", hex_buffer);
+		gdb_put_packet(connection, pktBuffer, pkt_len);
+		free(hex_buffer);
+		hex_buffer = NULL;
+
+		hex_buffer_size *= actualTotalSamplingTimes;
+		retval = gdb_write(connection, readVarBuffer, hex_buffer_size);
+		if (retval != ERROR_OK) {
+			free(readVarBuffer);
+			readVarBuffer = NULL;
+			return retval;
+		}
+		free(readVarBuffer);
+		readVarBuffer = NULL;
+
+		return ERROR_OK;
+	}
+#endif /* HISPARK_TRACE_MODIFIES */
+	else if (target->type->gdb_query_custom) {
 		char *buffer = NULL;
 		int ret = target->type->gdb_query_custom(target, packet, &buffer);
 		gdb_put_packet(connection, buffer, strlen(buffer));
@@ -3253,7 +3590,6 @@ static int gdb_v_packet(struct connection *connection,
 	int result;
 
 	struct target *target = get_target_from_connection(connection);
-
 	if (strncmp(packet, "vCont", 5) == 0) {
 		bool handled;
 
@@ -3523,6 +3859,19 @@ static int gdb_input_inner(struct connection *connection)
 
 		/* terminate with zero */
 		gdb_packet_buffer[packet_size] = '\0';
+#ifdef HISPARK_TRACE_MODIFIES
+		if (g_livewatchOpenFLag == 1) {
+			if ((gdb_packet_buffer[0] != 'q') && (gdb_packet_buffer[0] != 'Q')) {
+				if (g_pollEnableSwitch == 0) {
+					retval = cmsis_dap_cmd_DAP_Puase_VarMonitor(VARMONITOR_PAUCE);
+					if (retval != ERROR_OK) {
+						return retval;
+					}
+					g_pollEnableSwitch = 1;
+				}
+			}
+		}	
+#endif /* HISPARK_TRACE_MODIFIES */
 
 		if (packet_size > 0) {
 
@@ -3559,6 +3908,7 @@ static int gdb_input_inner(struct connection *connection)
 					retval = gdb_read_memory_packet(connection, packet, packet_size);
 					break;
 				case 'M':
+					LOG_INFO("%s", gdb_packet_buffer);
 					retval = gdb_write_memory_packet(connection, packet, packet_size);
 					break;
 				case 'z':

@@ -20,7 +20,11 @@
  * Those applications will have their own main() implementation
  * and use bits and pieces from openocd.c. */
 
+#ifdef _WIN32
+__declspec(dllexport) int main(int argc, char *argv[])
+#else
 int main(int argc, char *argv[])
+#endif
 {
 	/* disable buffering otherwise piping to logs causes problems work */
 	setvbuf(stdout, NULL, _IONBF, 0);

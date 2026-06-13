@@ -28,6 +28,7 @@
 #include <target/arm_adi_v5.h>
 #include <target/arm_tpiu_swo.h>
 #include <rtt/rtt.h>
+#include "flash/nor/flash_offline_load.h"
 
 #include <server/server.h>
 #include <server/gdb_server.h>
@@ -181,6 +182,83 @@ COMMAND_HANDLER(handle_init_command)
 	return ERROR_OK;
 }
 
+/* Hitool add divide init cmd into two parts */
+COMMAND_HANDLER(handle_init_step1_command)
+{
+
+	if (CMD_ARGC != 0)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	int retval;
+	static int initialized;
+	if (initialized)
+	{
+		return ERROR_OK;
+	}
+
+	initialized = 1;
+
+	retval = command_run_line(CMD_CTX, "target init");
+	if (ERROR_OK != retval)
+		return ERROR_FAIL;
+
+	retval = adapter_init(CMD_CTX);
+	if (retval != ERROR_OK) {
+		/* we must be able to set up the debug adapter */
+		return retval;
+	}
+
+	LOG_DEBUG("Debug Adapter init complete");
+
+	/* "transport init" verifies the expected devices are present;
+	 * for JTAG, it checks the list of configured TAPs against
+	 * what's discoverable, possibly with help from the platform's
+	 * JTAG event handlers.  (which require COMMAND_EXEC)
+	 */
+	command_context_mode(CMD_CTX, COMMAND_EXEC);
+
+	retval = command_run_line(CMD_CTX, "transport init");
+	if (ERROR_OK != retval)
+	{
+	    return ERROR_FAIL;
+	}
+	retval = command_run_line(CMD_CTX, "dap init");
+	if (ERROR_OK != retval)
+		return ERROR_FAIL;
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(handle_init_step2_command)
+{
+
+	if (CMD_ARGC != 0)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	LOG_DEBUG("Examining targets...");
+	if (target_examine() != ERROR_OK)
+		LOG_DEBUG("target examination failed");
+
+	command_context_mode(CMD_CTX, COMMAND_CONFIG);
+
+	if (command_run_line(CMD_CTX, "flash init") != ERROR_OK)
+		return ERROR_FAIL;
+
+	if (command_run_line(CMD_CTX, "nand init") != ERROR_OK)
+		return ERROR_FAIL;
+
+	if (command_run_line(CMD_CTX, "pld init") != ERROR_OK)
+		return ERROR_FAIL;
+	command_context_mode(CMD_CTX, COMMAND_EXEC);
+
+	/* initialize telnet subsystem */
+	gdb_target_add_all(all_targets);
+
+	target_register_event_callback(log_target_callback_event_handler, CMD_CTX);
+
+	return ERROR_OK;
+}
+
 COMMAND_HANDLER(handle_add_script_search_dir_command)
 {
 	if (CMD_ARGC != 1)
@@ -221,6 +299,20 @@ static const struct command_registration openocd_command_handlers[] = {
 		.mode = COMMAND_ANY,
 		.help = "dir to search for config files and scripts",
 		.usage = "<directory>"
+	},
+	{
+		.name = "init_step1",
+		.handler = &handle_init_step1_command,
+		.mode = COMMAND_ANY,
+		.help = "Initializes configured targets and adapter.  ",
+		.usage = ""
+	},
+	{
+		.name = "init_step2",
+		.handler = &handle_init_step2_command,
+		.mode = COMMAND_ANY,
+		.help = "Examining targets and initializes servers.  ",
+		.usage = ""
 	},
 	COMMAND_REGISTRATION_DONE
 };
@@ -301,7 +393,9 @@ static struct command_context *setup_command_handler(Jim_Interp *interp)
 	/* register subsystem commands */
 	typedef int (*command_registrant_t)(struct command_context *cmd_ctx_value);
 	static const command_registrant_t command_registrants[] = {
+#if 0
 		&workaround_for_jimtcl_expr,
+#endif
 		&openocd_register_commands,
 		&server_register_commands,
 		&gdb_register_commands,
@@ -316,6 +410,10 @@ static struct command_context *setup_command_handler(Jim_Interp *interp)
 		&cti_register_commands,
 		&dap_register_commands,
 		&arm_tpiu_swo_register_commands,
+#ifdef HISPARK_TRACE_MODIFIES
+		&flash_offline_register_commands,
+		&flash_load_register_commands,
+#endif /* HISPARK_TRACE_MODIFIES */
 		NULL
 	};
 	for (unsigned i = 0; command_registrants[i]; i++) {

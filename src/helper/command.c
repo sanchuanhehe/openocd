@@ -486,7 +486,7 @@ void command_print(struct command_invocation *cmd, const char *format, ...)
 		 *
 		 * The latter bit isn't precisely neat, but will do for now.
 		 */
-		Jim_AppendString(cmd->ctx->interp, cmd->output, string, -1);
+		LOG_USER_N("%s", string);
 		/* We already printed it above
 		 * command_output_text(context, string); */
 		free(string);

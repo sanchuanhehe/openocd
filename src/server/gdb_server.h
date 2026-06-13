@@ -23,6 +23,20 @@ struct reg;
 
 #define GDB_BUFFER_SIZE 16384
 
+#ifdef HISPARK_TRACE_MODIFIES
+typedef struct {
+	long long varAddress;
+	unsigned int varNumBytes;
+} gdb_var_list;
+
+typedef struct {
+	unsigned int periodUs;
+	unsigned int varNum;
+	gdb_var_list *varList;
+	unsigned int maxSampleTimes;
+} gdb_var_monitor;
+#endif /* HISPARK_TRACE_MODIFIES */
+
 int gdb_target_add_all(struct target *target);
 int gdb_register_commands(struct command_context *command_context);
 void gdb_service_free(void);
@@ -37,5 +51,10 @@ static inline struct target *get_target_from_connection(struct connection *conne
 
 #define ERROR_GDB_BUFFER_TOO_SMALL (-800)
 #define ERROR_GDB_TIMEOUT (-801)
+
+#ifdef HISPARK_TRACE_MODIFIES
+#define VARMONITOR_PAUCE          0x0
+#define VARMONITOR_RESUME         0x1
+#endif /* HISPARK_TRACE_MODIFIES */
 
 #endif /* OPENOCD_SERVER_GDB_SERVER_H */

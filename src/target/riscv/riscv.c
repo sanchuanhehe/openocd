@@ -1640,6 +1640,70 @@ static int riscv_assert_reset(struct target *target)
 	return ret;
 }
 
+/* NDMRESET does not reset the WS53 clock mux. ROM powers down/relocks the
+ * PLL during startup, so releasing a hart still clocked from it stops both
+ * the CPU and AP1 (persistent SWD WAIT). Switch the inactive MCU channel to
+ * XO before selecting it, following the WS53 SDK acore_switch_pll_clock(false).
+ * Run while halted at the reset vector; no ROM patch or RAM trampoline is used.
+ */
+static int ws53_reset_clock_to_xo(struct target *target)
+{
+	const target_addr_t channel0 = 0x52000578;
+	const target_addr_t channel1 = 0x5200057c;
+	const target_addr_t normal_mux = 0x520003e0;
+	const target_addr_t sleep_mux = 0x520003e4;
+	uint32_t status, config, normal, sleep;
+	int ret = target_read_u32(target, channel1, &status);
+
+	if (ret != ERROR_OK)
+		return ret;
+	unsigned active = (status >> 12) & 3;
+
+	if (active != 1 && active != 2) {
+		LOG_ERROR("WS53 MCU clock channel status is invalid: 0x%08" PRIx32, status);
+		return ERROR_FAIL;
+	}
+	target_addr_t inactive = active == 1 ? channel1 : channel0;
+	ret = target_read_u32(target, inactive, &config);
+	if (ret == ERROR_OK)
+		ret = target_read_u32(target, normal_mux, &normal);
+	if (ret == ERROR_OK)
+		ret = target_read_u32(target, sleep_mux, &sleep);
+	if (ret != ERROR_OK)
+		return ret;
+
+	/* Disable divider and gate on the inactive channel, select undivided XO,
+	 * then enable its clock before touching either mux. Preserve other bits.
+	 */
+	config &= ~0x11U;
+	ret = target_write_u32(target, inactive, config);
+	config &= ~0x1eeU;
+	if (ret == ERROR_OK)
+		ret = target_write_u32(target, inactive, config);
+	if (ret == ERROR_OK)
+		ret = target_write_u32(target, inactive, config | 1);
+	if (ret != ERROR_OK)
+		return ret;
+	alive_sleep(1);
+
+	uint32_t select = active == 1 ? BIT(6) : 0;
+	ret = target_write_u32(target, normal_mux, (normal & ~BIT(6)) | select);
+	if (ret == ERROR_OK)
+		ret = target_write_u32(target, sleep_mux, (sleep & ~BIT(6)) | select);
+	if (ret != ERROR_OK)
+		return ret;
+	alive_sleep(1);
+	ret = target_read_u32(target, channel1, &status);
+	if (ret != ERROR_OK)
+		return ret;
+	if (((status >> 12) & 3) != (active == 1 ? 2U : 1U)) {
+		LOG_ERROR("WS53 MCU clock did not switch to XO: 0x%08" PRIx32, status);
+		return ERROR_FAIL;
+	}
+	LOG_DEBUG("WS53 reset: MCU switched to XO on channel %u", active == 1 ? 1 : 0);
+	return ERROR_OK;
+}
+
 static int riscv_deassert_reset(struct target *target)
 {
 	LOG_DEBUG("[%d]", target->coreid);
@@ -1654,6 +1718,13 @@ static int riscv_deassert_reset(struct target *target)
 	if (ret != ERROR_OK || (!riscv_info(target)->ws63 && !riscv_info(target)->ws53))
 		return ret;
 	riscv_invalidate_register_cache(target);
+	if (riscv_info(target)->ws53) {
+		ret = ws53_reset_clock_to_xo(target);
+		if (ret != ERROR_OK) {
+			LOG_ERROR("WS53 reset clock preparation failed; keeping the CPU halted");
+			return ret;
+		}
+	}
 	ret = riscv_hisilicon_rearm(target);
 	if (ret == ERROR_OK && !halt)
 		ret = target_resume(target, true, 0, true, false);

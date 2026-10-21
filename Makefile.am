@@ -25,7 +25,12 @@ bin_PROGRAMS =
 noinst_LTLIBRARIES =
 info_TEXINFOS =
 dist_man_MANS =
-EXTRA_DIST = README.hisilicon.md doc/ws53.md doc/ws53-validation.md doc/ws63.md doc/ws63-setup.md
+EXTRA_DIST = README.hisilicon.md package.json doc/ws53.md doc/ws53-validation.md \
+	doc/ws63.md doc/ws63-setup.md doc/hisilicon-sync.md \
+	contrib/ws63/prepare_elf.py contrib/ws63/check_core.py \
+	contrib/ws63/check_decoder.py contrib/ws63/check_reset.py \
+	contrib/ws63/test_prepare_elf.py contrib/ws53/check_debug.py \
+	contrib/ws53/check_reset.py contrib/ws53/check_aps.py contrib/ws53/test_config.py
 
 if INTERNAL_JIMTCL
 SUBDIRS += jimtcl

@@ -39,6 +39,15 @@ for entry in ("WS63-jlink.cfg", "WS63-swd.cfg"):
         "proc init {} {}; proc halt {} {}", "-f", "target/vendorhm/" + entry,
         "-c", 'if {$WS63_FLASH != 0} {error "unexpected Flash enable"}; shutdown'], 0))
 
+# The imported legacy target calls init/halt; stub both to stay offline.
+for adapter in ("jlink.cfg", "ft2232h-ftdi-3322.cfg"):
+    cases.append(("3322-" + adapter, ["-f", "interface/" + adapter, "-c",
+        "proc init {} {}; proc halt {} {}", "-f", "target/vendorhm/3322-jlink.cfg",
+        "-c", 'if {[target current] ne "3322.cpu"} {error "wrong target"}; shutdown'], 0))
+cases.append(("ws63-ft2232h", ["-f", "interface/ft2232h-ftdi-ws63.cfg", "-c",
+    "proc init {} {}; proc halt {} {}", "-f", "target/vendorhm/WS63-swd.cfg",
+    "-c", 'if {$WS63_FLASH != 0} {error "unexpected Flash enable"}; shutdown'], 0))
+
 def check(name, search, options, expected):
     with tempfile.TemporaryDirectory() as cwd:
         result = subprocess.run([binary, "-s", str(search), *options], cwd=cwd,

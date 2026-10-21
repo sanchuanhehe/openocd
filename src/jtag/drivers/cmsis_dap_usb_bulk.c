@@ -130,7 +130,8 @@ static void PrintUsbPortNum(uint16_t vids[], uint16_t pids[])
 	    }
 	    LOG_INFO("usb %d port end", i);
 	}
-	return;
+	libusb_free_device_list(device_list, 1);
+	libusb_exit(ctx);
 }
 
 static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t pids[], const char *serial,

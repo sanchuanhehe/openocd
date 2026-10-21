@@ -190,6 +190,11 @@ typedef struct {
 	int debug_ap_num;
 	struct adiv5_dap *dap;
 	struct adiv5_ap *debug_ap;
+	/* HiSilicon 3322 only: the debug AP is an AHB-AP (no APB-AP found), and the
+	 * RISC-V Debug Module is held gated after a cold power-cycle until a vendor
+	 * DP register is written. Set in riscvcs013_init_dap() when the APB-AP
+	 * search falls back, so ungating runs only on 3322, not on APB-AP chips. */
+	bool needs_vendor_ungate;
 	/* The indexed used to address this hart in its DM. */
 	unsigned index;
 	/* Number of address bits in the dbus register. */
@@ -1629,6 +1634,74 @@ static int discover_vlenb(struct target *target)
 	return ERROR_OK;
 }
 
+/* HiSilicon 3322: after a cold power-cycle the RISC-V Debug Module is held
+ * gated until a vendor DP register is written. This mirrors the SEGGER
+ * ConnectCore.JLinkScript InitTarget() sequence:
+ *
+ *   WriteDP(ABORT,    0xFFFFFFFF)   clear sticky DP faults
+ *   WriteDP(SELECT,   0xE)          select DP bank 0xE
+ *   WriteDP(CTRL/STAT,3)            vendor ungating register -> 3
+ *   ReadDP(CTRL/STAT)               commit the write
+ *
+ * It must run before any DMI access, because dmcontrol reads 0 while the DM is
+ * gated (the symptom is "Debug Module did not become active").
+ *
+ * The vendor register lives at DP bank 0xE, address 0x4 (the CTRL/STAT slot).
+ * We reach it through the normal DAP queue API by passing a bank-0xE register
+ * constant (BANK_REG(0xE, 0x4)). Both the SWD and JTAG DP layers derive the DP
+ * bank from the register's bits[7:4] and write DP SELECT for us, so this works
+ * identically on either transport. This is why earlier fixes failed:
+ *   - the SWD-only raw driver path (swd->write_reg) never ran under JTAG; and
+ *   - writing DP_CTRL_STAT (a bank-0 register) made the DAP layer's automatic
+ *     bank-select reset DPBANKSEL back to 0, so the vendor register at bank 0xE
+ *     was never actually written. */
+static int riscvcs013_vendor_ungate_dm(struct target *target)
+{
+	riscv013_info_t *info = get_info(target);
+	struct adiv5_dap *dap = info->dap;
+	if (!dap || !dap->ops) {
+		LOG_ERROR("3322: cannot ungate DM, DAP not available");
+		return ERROR_FAIL;
+	}
+
+	LOG_INFO("3322: vendor DM ungating via DP bank 0xE");
+
+	/* Clear sticky faults left by earlier accesses against the gated DM. */
+	int retval = dap_queue_dp_write(dap, DP_ABORT, 0xFFFFFFFFu);
+
+	/* Vendor ungating: DP bank 0xE, address 0x4, value 3. */
+	const unsigned int dp_vendor_ungate_reg = BANK_REG(0xE, 0x4);
+	if (retval == ERROR_OK) {
+		retval = dap_queue_dp_write(dap, dp_vendor_ungate_reg, 3u);
+	}
+
+	/* Read back to commit the write (matches SEGGER ReadDP(CTRL/STAT)). */
+	uint32_t ctrlstat = 0;
+	if (retval == ERROR_OK) {
+		retval = dap_queue_dp_read(dap, dp_vendor_ungate_reg, &ctrlstat);
+	}
+
+	if (retval != ERROR_OK) {
+		LOG_ERROR("3322: failed to queue vendor ungating (rc=%d)", retval);
+		return retval;
+	}
+
+	retval = dap_run(dap);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("3322: vendor DM ungating failed (dap_run rc=%d)", retval);
+		return retval;
+	}
+	LOG_INFO("3322: vendor ungating done, bank0xE CTRL/STAT=0x%08x", ctrlstat);
+
+	/* Invalidate the cached DP SELECT so the next access re-selects bank 0. */
+	dap->select = DP_SELECT_INVALID;
+
+	/* Give the DM time to power up after being ungated. */
+	alive_sleep(50);
+
+	return ERROR_OK;
+}
+
 static int examine(struct target *target)
 {
 	RISCV_INFO(generic_info);
@@ -1659,6 +1732,17 @@ static int examine(struct target *target)
     	info->dtmcs_idle = get_field(dtmcontrol, DTM_DTMCS_IDLE);
 	}
 	
+	/* HiSilicon 3322 (CoreSight/AHB-AP): ungate the vendor-held Debug Module
+	 * before touching it, otherwise dmcontrol reads 0 and we bail out with
+	 * "Debug Module did not become active". Needs the DAP connected (it is, by
+	 * the time we examine) and is a no-op for non-3322 CoreSight targets. */
+	if (generic_info->debug_type == RISCV_CORESIGHT && info->needs_vendor_ungate) {
+		int retval = riscvcs013_vendor_ungate_dm(target);
+		if (retval != ERROR_OK) {
+			return retval;
+		}
+	}
+
 	/* Reset the Debug Module. */
 	dm013_info_t *dm = get_dm(target);
 	if (!dm)
@@ -5281,12 +5365,29 @@ static int riscvcs013_init_dap(struct target *target)
 	info->debug_ap_num = target->ap_sel; //script specific
 	LOG_DEBUG("DAP select %d.", info->debug_ap_num);
 
+	/* WS53 uses an AHB-AP; WS63 and the other original targets use APB.
+	 * Retain the legacy non-APB fallback for targets such as 3322.
+	 */
 	int retval = dap_find_ap_num(info->dap,
 			riscv_info(target)->ws53 ? AP_TYPE_AHB3_AP : AP_TYPE_APB_AP,
 			&info->debug_ap, info->debug_ap_num);
 	if (retval != ERROR_OK) {
-		LOG_ERROR("Could not find the expected debug AP %d", info->debug_ap_num);
-		return retval;
+		if (riscv_info(target)->ws53) {
+			LOG_ERROR("WS53 requires an AHB-AP at AP %d", info->debug_ap_num);
+			return retval;
+		}
+		LOG_DEBUG("No APB-AP at debug_ap[%d]; fall back to AP %d (non-APB MEM-AP, e.g. 3322 AHB-AP)",
+				info->debug_ap_num, info->debug_ap_num);
+		info->debug_ap = dap_get_ap(info->dap, info->debug_ap_num);
+		if (!info->debug_ap) {
+			LOG_ERROR("Could not get AP %d for debug access", info->debug_ap_num);
+			return ERROR_FAIL;
+		}
+		/* Only the 3322 (AHB-AP, no APB-AP) reaches here: its RISC-V Debug
+		 * Module is vendor-gated on cold boot. Flag it so examine() ungates
+		 * the DM before the first DMI access. APB-AP chips keep working as
+		 * before, untouched. */
+		info->needs_vendor_ungate = true;
 	}
 
 	if (riscv_info(target)->ws53)

@@ -45,6 +45,7 @@ char bin_name[MAX_BINNAME_LEN];
 char chip_param_file_name[MAX_BINNAME_LEN];
 char base_adress[MAX_BINNAME_LEN];
 const char *chip_type_array[] = {
+	"3322",
 	"WS63",
 	"NB18-ACORE",
 	"NB18-PCORE",

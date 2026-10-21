@@ -282,6 +282,7 @@ char* extract_chip(const char* str, char* chip, size_t size) {
 	const char* start_substr2 = "target/CHIP-MCU/";
     const char* end_substr1 = "-swd.cfg";
     const char* end_substr2 = "-jtag.cfg";
+    const char* end_substr3 = "-jlink.cfg";
     char *found_start, *found_end;
     // Find the start substring
 	char* start_substr_index = start_substr;
@@ -290,17 +291,36 @@ char* extract_chip(const char* str, char* chip, size_t size) {
         found_start = strstr(str, start_substr2);
 		start_substr_index = start_substr2;
     }
+    if (!found_start) {
+        found_start = (char *)str;
+        start_substr_index = "";
+    }
     if (found_start) {
         // Skip the start substring
         found_start += strlen(start_substr_index);
         // Find the end substring
         found_end = strstr(found_start, end_substr1);
         if (!found_end) {
-            // If -swd.cfg is not found, try to find -jtage.cfg
+            // If -swd.cfg is not found, try to find -jtag.cfg
             found_end = strstr(found_start, end_substr2);
+        }
+        if (!found_end) {
+            // If -jtag.cfg is not found, try to find -jlink.cfg
+            found_end = strstr(found_start, end_substr3);
         }
 
         if (found_end) {
+            /* Strip any subdirectory between "target\" and the chip file name
+             * (e.g. target\vendorhm\3322-jlink.cfg -> "3322"), so cfgs do not
+             * have to live directly under target\ for the routing to engage.
+             * Scan backwards for the last path separator in the name range. */
+            for (char *p = found_end; p > found_start;) {
+                --p;
+                if (*p == '\\' || *p == '/') {
+                    found_start = p + 1;
+                    break;
+                }
+            }
             // Calculate the length of the extracted chip string
             size_t len = found_end - found_start;
 

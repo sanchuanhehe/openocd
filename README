@@ -2,7 +2,7 @@ Welcome to OpenOCD!
 ===================
 
 HiSilicon branch: see README.hisilicon.md for WS53/WS63 build instructions,
-hardware validation and the known WS53 reset-run limitation.
+hardware validation, AP access and the WS53 reset clock fix.
 
 OpenOCD provides on-chip programming and debugging support with a
 layered architecture of JTAG interface and TAP support including:

@@ -25,7 +25,7 @@ bin_PROGRAMS =
 noinst_LTLIBRARIES =
 info_TEXINFOS =
 dist_man_MANS =
-EXTRA_DIST =
+EXTRA_DIST = README.hisilicon.md doc/ws53.md doc/ws53-validation.md doc/ws63.md doc/ws63-setup.md
 
 if INTERNAL_JIMTCL
 SUBDIRS += jimtcl

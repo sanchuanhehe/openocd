@@ -35,6 +35,7 @@ static struct rtos_type *rtos_types[] = {
 	&freertos_rtos,
 	&ecos_rtos,
 	&linux_rtos,
+	&liteos_ws63_rtos,
 	&chibios_rtos,
 	&chromium_ec_rtos,
 	&embkernel_rtos,
@@ -499,11 +500,23 @@ static int rtos_put_gdb_reg_list(struct connection *connection,
 		num_bytes += DIV_ROUND_UP(reg_list[i].size, 8) * 2;
 
 	char *hex = malloc(num_bytes);
+	if (!hex)
+		return ERROR_FAIL;
 	char *hex_p = hex;
+	struct rtos *rtos = get_target_from_connection(connection)->rtos;
 
 	for (int i = 0; i < num_regs; ++i) {
 		size_t count = DIV_ROUND_UP(reg_list[i].size, 8);
-		size_t n = hexify(hex_p, reg_list[i].value, count, num_bytes);
+		size_t n;
+
+		if (rtos->type->supports_unavailable_registers &&
+				reg_list[i].unavailable) {
+			n = count * 2;
+			memset(hex_p, 'x', n);
+			hex_p[n] = 0;
+		} else {
+			n = hexify(hex_p, reg_list[i].value, count, num_bytes);
+		}
 		hex_p += n;
 		num_bytes -= n;
 	}
@@ -736,4 +749,12 @@ int rtos_write_buffer(struct target *target, target_addr_t address,
 	if (target->rtos->type->write_buffer)
 		return target->rtos->type->write_buffer(target->rtos, address, size, buffer);
 	return ERROR_NOT_IMPLEMENTED;
+}
+
+bool rtos_register_view_read_only(struct target *target)
+{
+	struct rtos *r = target->rtos;
+
+	return r && r->type->thread_registers_read_only && r->current_threadid > 0 &&
+		r->current_threadid != r->current_thread;
 }

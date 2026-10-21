@@ -73,7 +73,6 @@ extern const struct flash_driver str9x_flash;
 extern const struct flash_driver str9xpec_flash;
 extern const struct flash_driver swm050_flash;
 extern const struct flash_driver hm3061m_info_flash;
-extern const struct flash_driver ws63_info_flash;
 extern const struct flash_driver nb_info_flash;
 extern const struct flash_driver hm3065_info_flash;
 extern const struct flash_driver hm3066_main_flash;
@@ -89,6 +88,7 @@ extern const struct flash_driver au80_flash;
 extern const struct flash_driver tms470_flash;
 extern const struct flash_driver virtual_flash;
 extern const struct flash_driver w600_flash;
+extern const struct flash_driver ws63_flash;
 extern const struct flash_driver xcf_flash;
 extern const struct flash_driver xmc1xxx_flash;
 extern const struct flash_driver xmc4xxx_flash;
@@ -166,7 +166,6 @@ static const struct flash_driver * const flash_drivers[] = {
 	&str9xpec_flash,
 	&swm050_flash,
 	&hm3061m_info_flash,
-	&ws63_info_flash,
 	&nb_info_flash,
 	&hm3065_info_flash,
 	&hm128_flash,
@@ -178,6 +177,7 @@ static const struct flash_driver * const flash_drivers[] = {
 	&au80_flash,
 	&tms470_flash,
 	&virtual_flash,
+	&ws63_flash,
 	&xcf_flash,
 	&xmc1xxx_flash,
 	&xmc4xxx_flash,

@@ -3,6 +3,7 @@
 noinst_LTLIBRARIES += %D%/librtos.la
 %C%_librtos_la_SOURCES = \
 	%D%/rtos.c \
+	%D%/liteos_ws63.c \
 	%D%/rtos_standard_stackings.c \
 	%D%/rtos_ecos_stackings.c  \
 	%D%/rtos_chibios_stackings.c \

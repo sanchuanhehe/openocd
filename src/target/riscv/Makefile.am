@@ -10,6 +10,7 @@ noinst_LTLIBRARIES += %D%/libriscv.la
        %D%/opcodes.h \
        %D%/program.h \
        %D%/riscv.h \
+       %D%/ws63_insn.h \
        %D%/batchcs.h \
        %D%/batch.c \
        %D%/program.c \

@@ -9,6 +9,7 @@ noinst_LTLIBRARIES += %D%/libocdflashnor.la
 	$(NORHEADERS)
 
 NOR_DRIVERS = \
+	%D%/ws63.c \
 	%D%/aduc702x.c \
 	%D%/aducm360.c \
 	%D%/ambiqmicro.c \
@@ -78,7 +79,6 @@ NOR_DRIVERS = \
 	%D%/hm3066_main.c\
 	%D%/hm3066_info.c\
 	%D%/flash_offline_load.c\
-	%D%/ws63.c\
 	%D%/hi3071_main.c\
 	%D%/hi3066h_main.c\
 	%D%/hi3066h_info.c\

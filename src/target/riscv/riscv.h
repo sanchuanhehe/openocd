@@ -96,6 +96,17 @@ typedef enum {
 
 struct riscv_info {
 	unsigned int common_magic;
+	/* WS63 features are opt-in; other riscvcs chips retain their paths. */
+	bool ws63;
+	bool ws53; /* AP1 Debug Module, AP0 vendor debug enable. */
+	struct adiv5_ap *ws63_ap1;
+	bool hisilicon_rearm;
+	bool hisilicon_resume_after_reset;
+	bool ws63_flash_failed;
+	bool ws63_flash_changed;
+	bool ws63_flash_enabled;
+	bool ws63_flash_breakpoints;
+	bool ws63_patching_breakpoint;
 	debug_type_t debug_type;
 	unsigned dtm_version;
 
@@ -337,6 +348,12 @@ int riscv_current_hartid(const struct target *target);
 int riscv_count_harts(struct target *target);
 
 /** Set register, updating the cache. */
+int riscv_ws63_sync(struct target *target);
+int riscv_hisilicon_rearm(struct target *target);
+int riscv_ws63_check_write(struct target *target, target_addr_t address, uint64_t length);
+int ws63_flash_patch(struct target *target, target_addr_t address, const uint8_t *data,
+		uint32_t count);
+
 int riscv_set_register(struct target *target, enum gdb_regno i, riscv_reg_t v);
 /** Get register, from the cache if it's in there. */
 int riscv_get_register(struct target *target, riscv_reg_t *value,

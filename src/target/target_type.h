@@ -29,6 +29,8 @@ struct target_type {
 	 * field directly, use target_type_name() instead.
 	 */
 	const char *name;
+	/* Optional complete GDB memory-map XML; caller frees the returned string. */
+	char *(*get_gdb_memory_map)(struct target *target);
 
 	/* poll current target status */
 	int (*poll)(struct target *target);

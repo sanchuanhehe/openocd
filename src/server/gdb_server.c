@@ -1216,6 +1216,10 @@ static int gdb_last_signal_packet(struct connection *connection,
 		return ERROR_OK;
 	}
 
+	if (target->rtos && target->rtos->type == &liteos_ws63_rtos) {
+		gdb_signal_reply(target, connection);
+		return ERROR_OK;
+	}
 	signal_var = gdb_last_signal(target);
 
 	snprintf(sig_reply, 4, "S%2.2x", signal_var);
@@ -1295,8 +1299,13 @@ static int gdb_get_registers_packet(struct connection *connection,
 	LOG_DEBUG("-");
 #endif
 
-	if ((target->rtos) && (rtos_get_gdb_reg_list(connection) == ERROR_OK))
-		return ERROR_OK;
+	if (target->rtos) {
+		retval = rtos_get_gdb_reg_list(connection);
+		if (retval == ERROR_OK)
+			return ERROR_OK;
+		if (rtos_register_view_read_only(target))
+			return gdb_error(connection, retval);
+	}
 
 	retval = target_get_gdb_reg_list(target, &reg_list, &reg_list_size,
 			REG_CLASS_GENERAL);
@@ -1427,8 +1436,13 @@ static int gdb_get_register_packet(struct connection *connection,
 	LOG_DEBUG("-");
 #endif
 
-	if ((target->rtos) && (rtos_get_gdb_reg(connection, reg_num) == ERROR_OK))
-		return ERROR_OK;
+	if (target->rtos) {
+		retval = rtos_get_gdb_reg(connection, reg_num);
+		if (retval == ERROR_OK)
+			return ERROR_OK;
+		if (rtos_register_view_read_only(target))
+			return gdb_error(connection, retval);
+	}
 
 	retval = target_get_gdb_reg_list_noread(target, &reg_list, &reg_list_size,
 			REG_CLASS_ALL);
@@ -2007,6 +2021,14 @@ static int gdb_memory_map(struct connection *connection,
 	offset = strtoul(packet, &separator, 16);
 	length = strtoul(separator + 1, &separator, 16);
 
+	if (target->type->get_gdb_memory_map) {
+		xml = target->type->get_gdb_memory_map(target);
+		if (xml) {
+			pos = strlen(xml);
+			goto send_memory_map;
+		}
+	}
+
 	xml_printf(&retval, &xml, &pos, &size, "<memory-map>\n");
 
 	/* Sort banks in ascending order.  We need to report non-flash
@@ -2112,11 +2134,20 @@ static int gdb_memory_map(struct connection *connection,
 		return retval;
 	}
 
-	if (offset + length > pos)
+send_memory_map:
+	if (offset < 0 || length < 0 || offset > pos) {
+		free(xml);
+		return gdb_error(connection, ERROR_FAIL);
+	}
+	if (length > pos - offset)
 		length = pos - offset;
 
 	char *t = malloc(length + 1);
-	t[0] = 'l';
+	if (!t) {
+		free(xml);
+		return ERROR_FAIL;
+	}
+	t[0] = offset + length < pos ? 'm' : 'l';
 	memcpy(t + 1, xml + offset, length);
 	gdb_put_packet(connection, t, length + 1);
 
@@ -2995,7 +3026,8 @@ static int gdb_query_packet(struct connection *connection,
 			&size,
 			"PacketSize=%x;qXfer:memory-map:read%c;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+",
 			GDB_BUFFER_SIZE,
-			((gdb_use_memory_map == 1) && (flash_get_bank_count() > 0)) ? '+' : '-',
+			((gdb_use_memory_map == 1) && (flash_get_bank_count() > 0 ||
+					target->type->get_gdb_memory_map)) ? '+' : '-',
 			(gdb_target_desc_supported == 1) ? '+' : '-');
 
 		if (retval != ERROR_OK) {
@@ -3008,7 +3040,7 @@ static int gdb_query_packet(struct connection *connection,
 
 		return ERROR_OK;
 	} else if ((strncmp(packet, "qXfer:memory-map:read::", 23) == 0)
-		   && (flash_get_bank_count() > 0))
+		   && (flash_get_bank_count() > 0 || target->type->get_gdb_memory_map))
 		return gdb_memory_map(connection, packet, packet_size);
 	else if (strncmp(packet, "qXfer:features:read:", 20) == 0) {
 		char *xml = NULL;
@@ -3395,6 +3427,11 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 			 * check if the thread to be stepped is the current rtos thread
 			 * if not, we must fake the step
 			 */
+			if (target->rtos->type == &liteos_ws63_rtos && thread_id > 0 &&
+					target->rtos->current_thread != thread_id) {
+				gdb_error(connection, ERROR_FAIL);
+				return true;
+			}
 			if (target->rtos->current_thread != thread_id)
 				fake_step = true;
 		}
@@ -3821,6 +3858,12 @@ static void gdb_log_callback(void *priv, const char *file, unsigned line,
 
 static void gdb_sig_halted(struct connection *connection)
 {
+	struct target *target = get_target_from_connection(connection);
+
+	if (target->rtos && target->rtos->type == &liteos_ws63_rtos) {
+		gdb_signal_reply(target, connection);
+		return;
+	}
 	char sig_reply[4];
 	snprintf(sig_reply, 4, "T%2.2x", 2);
 	gdb_put_packet(connection, sig_reply, 3);
@@ -3878,6 +3921,14 @@ static int gdb_input_inner(struct connection *connection)
 			gdb_log_incoming_packet(connection, gdb_packet_buffer);
 
 			retval = ERROR_OK;
+			if (rtos_register_view_read_only(target) &&
+					(packet[0] == 'P' || packet[0] == 'G' || packet[0] == 's' ||
+							packet[0] == 'S' ||
+					(!strncmp(packet, "vCont;", 6) && (strstr(packet, ";s") ||
+							strstr(packet, ";S"))))) {
+				gdb_put_packet(connection, "E01", 3);
+				continue;
+			}
 			switch (packet[0]) {
 				case 'T':	/* Is thread alive? */
 					gdb_thread_packet(connection, packet, packet_size);

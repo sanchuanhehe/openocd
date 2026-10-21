@@ -85,6 +85,9 @@ static int dmi_read(struct target *target, uint32_t *value, uint32_t address);
 static int dmi_write(struct target *target, uint32_t address, uint32_t value);
 static int dmi_read_fast(struct target *target, uint32_t *value, uint32_t address);
 static int dmi_write_fast(struct target *target, uint32_t address, uint32_t value);
+static int checked_memory_progbuf(struct target *target, target_addr_t address,
+		uint32_t size, uint32_t count, uint32_t increment,
+		uint8_t *read_buffer, const uint8_t *write_buffer);
 static int write_memory_progbuf_cs(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer);
 static int write_memory_progbuf(struct target *target, target_addr_t address,
@@ -1785,6 +1788,11 @@ static int examine(struct target *target)
 	if (riscv013_select_current_hart(target) != ERROR_OK)
 		return ERROR_FAIL;
 
+	if (r->ws63) {
+		memset(dm->progbuf_cache, 0, sizeof(dm->progbuf_cache));
+		if (dmi_write(target, DM_ABSTRACTAUTO, 0) != ERROR_OK)
+			return ERROR_FAIL;
+	}
 	if (riscv013_halt_go(target) != ERROR_OK) {
 		LOG_ERROR("Fatal: Hart %d failed to halt during examine()", r->current_hartid);
 		return ERROR_FAIL;
@@ -1819,7 +1827,14 @@ static int examine(struct target *target)
 	LOG_DEBUG(" hart %d: XLEN=%d, misa=0x%" PRIx64, r->current_hartid, r->xlen,
 			r->misa);
 
-	riscv013_step_or_resume_current_hart(target, false, false);
+	if (r->ws63) {
+		target->state = TARGET_HALTED;
+		r->hisilicon_rearm = true;
+		if (riscv_hisilicon_rearm(target) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+	if (riscv013_step_or_resume_current_hart(target, false, false) != ERROR_OK)
+		return ERROR_FAIL;
 
 	target_set_examined(target);
 
@@ -2552,6 +2567,21 @@ static ChipType get_chip_type_id(const char *chip_type)
 
 static int assert_reset(struct target *target)
 {
+	if (riscv_info(target)->ws63 || riscv_info(target)->ws53) {
+		dm013_info_t *dm = get_dm(target);
+
+		if (!dm)
+			return ERROR_FAIL;
+		uint32_t control = set_hartsel(DM_DMCONTROL_DMACTIVE |
+			DM_DMCONTROL_HALTREQ | DM_DMCONTROL_NDMRESET, riscv_current_hartid(target));
+		int ret = dmi_write(target, DM_DMCONTROL, control);
+
+		if (ret != ERROR_OK)
+			return ret;
+		memset(dm->progbuf_cache, 0, sizeof(dm->progbuf_cache));
+		target->state = TARGET_RESET;
+		return ERROR_OK;
+	}
 	RISCV_INFO(r);
 
 	select_dmi(target);
@@ -2618,6 +2648,35 @@ static int assert_reset(struct target *target)
 
 static int deassert_reset(struct target *target)
 {
+	if (riscv_info(target)->ws63 || riscv_info(target)->ws53) {
+		uint32_t control = set_hartsel(DM_DMCONTROL_DMACTIVE | DM_DMCONTROL_HALTREQ,
+			riscv_current_hartid(target));
+		int ret = dmi_write(target, DM_DMCONTROL, control);
+
+		if (ret != ERROR_OK)
+			return ret;
+		int64_t deadline = timeval_ms() + 1000LL * riscv_reset_timeout_sec;
+		uint32_t status;
+
+		do {
+			ret = dmstatus_read(target, &status, true);
+			if (ret != ERROR_OK)
+				return ret;
+			if ((status & DM_DMSTATUS_ALLHALTED) &&
+					!(status & DM_DMSTATUS_ANYUNAVAIL)) {
+				ret = dmi_write(target, DM_DMCONTROL,
+						(control & ~DM_DMCONTROL_HALTREQ) |
+					DM_DMCONTROL_ACKHAVERESET);
+				if (ret != ERROR_OK)
+					return ret;
+				target->state = TARGET_HALTED;
+				target->debug_reason = DBG_REASON_DBGRQ;
+				return ERROR_OK;
+			}
+			keep_alive();
+		} while (timeval_ms() < deadline);
+		return ERROR_TIMEOUT_REACHED;
+	}
 #ifdef HISPARK_TRACE_MODIFIES
 	int64_t ms_end;
 
@@ -3783,6 +3842,8 @@ static int read_memory_progbuf(struct target *target, target_addr_t address,
 static int read_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer, uint32_t increment)
 {
+	if (riscv_info(target)->ws63 || riscv_info(target)->ws53)
+		return checked_memory_progbuf(target, address, size, count, increment, buffer, NULL);
 	if (count == 0)
 		return ERROR_OK;
 
@@ -4233,6 +4294,8 @@ error:
 static int write_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
+	if (riscv_info(target)->ws63 || riscv_info(target)->ws53)
+		return checked_memory_progbuf(target, address, size, count, size, NULL, buffer);
 	if (size != 1 && size != 2 && size != 4 && size != 8 && size != 16) {
 		LOG_ERROR("BUG: Unsupported size for memory write: %d", size);
 		return ERROR_FAIL;
@@ -4549,6 +4612,15 @@ static bool riscv013_is_halted(struct target *target)
 	if (get_field(dmstatus, DM_DMSTATUS_ANYHAVERESET)) {
 		int hartid = riscv_current_hartid(target);
 		LOG_INFO("Hart %d unexpectedly reset!", hartid);
+		if (riscv_info(target)->ws63 || riscv_info(target)->ws53) {
+			riscv_info(target)->hisilicon_rearm = true;
+			riscv_info(target)->hisilicon_resume_after_reset |=
+				target->state == TARGET_RUNNING;
+			dm013_info_t *dm = get_dm(target);
+
+			if (dm)
+				memset(dm->progbuf_cache, 0, sizeof(dm->progbuf_cache));
+		}
 		/* TODO: Can we make this more obvious to eg. a gdb user? */
 		uint32_t dmcontrol = DM_DMCONTROL_DMACTIVE |
 			DM_DMCONTROL_ACKHAVERESET;
@@ -4558,7 +4630,7 @@ static bool riscv013_is_halted(struct target *target)
 		 * message that a reset happened, that the target is running, and then
 		 * that it is halted again once the request goes through.
 		 */
-		if (target->state == TARGET_HALTED)
+		if (target->state == TARGET_HALTED || riscv_info(target)->ws63 || riscv_info(target)->ws53)
 			dmcontrol |= DM_DMCONTROL_HALTREQ;
 		dmi_write(target, DM_DMCONTROL, dmcontrol);
 	}
@@ -5025,6 +5097,12 @@ static int maybe_execute_fence_i(struct target *target)
 /* Helper Functions. */
 static int riscv013_on_step_or_resume(struct target *target, bool step)
 {
+	if (riscv_info(target)->ws63 &&
+			(riscv_info(target)->ws63_flash_failed ||
+					riscv_info(target)->ws63_flash_changed))
+		return ERROR_FAIL;
+	if (riscv_hisilicon_rearm(target) != ERROR_OK)
+		return ERROR_FAIL;
 	if (maybe_execute_fence_i(target) != ERROR_OK)
 		return ERROR_FAIL;
 
@@ -5113,6 +5191,76 @@ void riscv013_clear_abstract_error(struct target *target)
 }
 
 
+#define WS53_CSW_DEFAULT 0x43800000
+
+/* Match the WS53 HiSpark TAR/DRW sequence, without banked transfers. */
+static int ws53_ap_access(struct adiv5_ap *ap, uint32_t address,
+		uint32_t *value, bool write)
+{
+	int ret = dap_queue_ap_write(ap, MEM_AP_REG_CSW(ap->dap),
+			ap->csw_default | CSW_32BIT | CSW_ADDRINC_OFF);
+	if (ret == ERROR_OK)
+		ret = dap_queue_ap_write(ap, MEM_AP_REG_TAR(ap->dap), address);
+	if (ret == ERROR_OK) {
+		if (write)
+			ret = dap_queue_ap_write(ap, MEM_AP_REG_DRW(ap->dap), *value);
+		else
+			ret = dap_queue_ap_read(ap, MEM_AP_REG_DRW(ap->dap), value);
+	}
+	if (ret == ERROR_OK)
+		ret = dap_run(ap->dap);
+	ap->csw_value = 0;
+	ap->tar_valid = false;
+	return ret;
+}
+
+/* HiSpark WS53 connectCore.JLinkScript: vendor DP bank 0xE value 1,
+ * then AP0[0xF0000038] = 1 before accessing the AP1 Debug Module.
+ * This is distinct from the 3322 value-3 ungating sequence.
+ */
+static int ws53_enable_debug(struct adiv5_dap *dap)
+{
+	uint32_t value;
+	dap->dp_ctrl_stat &= ~CORUNDETECT;
+	int ret = dap_queue_dp_write(dap, DP_CTRL_STAT, dap->dp_ctrl_stat);
+	if (ret == ERROR_OK)
+		ret = dap_queue_dp_write(dap, DP_ABORT, STKERRCLR | ORUNERRCLR | WDERRCLR);
+	if (ret == ERROR_OK)
+		ret = dap_queue_dp_write(dap, BANK_REG(0xE, 0x4), 1);
+	if (ret == ERROR_OK)
+		ret = dap_queue_dp_read(dap, BANK_REG(0xE, 0x4), &value);
+	if (ret == ERROR_OK)
+		ret = dap_run(dap);
+	if (ret != ERROR_OK)
+		return ret;
+	LOG_DEBUG("WS53 vendor enable readback: 0x%08" PRIx32, value);
+	ret = dap_queue_dp_write(dap, DP_SELECT, 0);
+	if (ret == ERROR_OK)
+		ret = dap_run(dap);
+	if (ret != ERROR_OK)
+		return ret;
+
+	struct adiv5_ap *ap = dap_get_ap(dap, 0);
+	if (!ap)
+		return ERROR_FAIL;
+	/* CSW protection attributes observed in HiSpark's WS53 initialization. */
+	ap->csw_default = WS53_CSW_DEFAULT;
+	ap->memaccess_tck = 8;
+	value = 1;
+	ret = ws53_ap_access(ap, 0xF0000038, &value, true);
+	/* Do not read this vendor enable address back: the reference script's
+	 * read returns 0xFFFFFFFF on WS53. Clear its sticky bus status before
+	 * accessing AP1; examine() validates the actual DM state there.
+	 */
+	dap_put_ap(ap);
+	if (ret != ERROR_OK)
+		return ret;
+	ret = dap_queue_dp_write(dap, DP_ABORT, STKERRCLR | ORUNERRCLR | WDERRCLR);
+	if (ret == ERROR_OK)
+		ret = dap_run(dap);
+	return ret;
+}
+
 static int riscvcs013_init_dap(struct target *target)
 {
 	LOG_DEBUG("riscv init CoreSight-APB-AP...");
@@ -5123,20 +5271,29 @@ static int riscvcs013_init_dap(struct target *target)
 	* we call ahbap_debugport_init(info->dap:swjdp) instead
 	*/
 
-	/* Search for the APB-AP - it is needed for access to debug registers */
-	info->debug_ap_num =target->ap_sel; //script specific
-
+	if (riscv_info(target)->ws53) {
+		int ret = ws53_enable_debug(info->dap);
+		if (ret != ERROR_OK) {
+			LOG_ERROR("WS53 debug enable failed");
+			return ret;
+		}
+	}
+	info->debug_ap_num = target->ap_sel; //script specific
 	LOG_DEBUG("DAP select %d.", info->debug_ap_num);
-	int retval = dap_find_ap_num(info->dap, AP_TYPE_APB_AP, &info->debug_ap, info->debug_ap_num);
 
+	int retval = dap_find_ap_num(info->dap,
+			riscv_info(target)->ws53 ? AP_TYPE_AHB3_AP : AP_TYPE_APB_AP,
+			&info->debug_ap, info->debug_ap_num);
 	if (retval != ERROR_OK) {
-		LOG_ERROR("Could not find APB-AP for debug access");
+		LOG_ERROR("Could not find the expected debug AP %d", info->debug_ap_num);
 		return retval;
 	}
 
+	if (riscv_info(target)->ws53)
+		info->debug_ap->csw_default = WS53_CSW_DEFAULT;
 	retval = mem_ap_init(info->debug_ap);
 	if (retval != ERROR_OK) {
-		LOG_ERROR("Could not initialize the APB-AP");
+		LOG_ERROR("Could not initialize debug AP %d", info->debug_ap_num);
 		return retval;
 	}
 	info->debug_ap->memaccess_tck = 8; // LGTM
@@ -5147,6 +5304,11 @@ static int riscvcs013_init_dap(struct target *target)
 static void riscvcs013_deinit_dap(struct target *target)
 {
 	LOG_DEBUG("riscv deinit CoreSight-APB-AP...");
+	riscv013_info_t *info = get_info(target);
+	if (info->debug_ap) {
+		dap_put_ap(info->debug_ap);
+		info->debug_ap = NULL;
+	}
 	if (target->private_config) {
 		free(target->private_config);
 		target->private_config = NULL;
@@ -5157,6 +5319,11 @@ static int dmi_read_cs(struct target *target, uint32_t *value, uint32_t address)
 {
 	riscv013_info_t *info = get_info(target);
 	struct adiv5_ap *ap = info->debug_ap;
+	if (riscv_info(target)->ws53) {
+		uint32_t discard;
+		return ws53_ap_access(ap, address << RISCVCS_ADDRESS_SHIFT,
+				value ? value : &discard, false);
+	}
 	if (value) {
  		return mem_ap_read_atomic_u32(ap, address << RISCVCS_ADDRESS_SHIFT, value);
 	} else {
@@ -5169,6 +5336,8 @@ static int dmi_write_cs(struct target *target, uint32_t address, uint32_t value)
 {
 	riscv013_info_t *info = get_info(target);
 	struct adiv5_ap *ap = info->debug_ap;
+	if (riscv_info(target)->ws53)
+		return ws53_ap_access(ap, address << RISCVCS_ADDRESS_SHIFT, &value, true);
 	return mem_ap_write_atomic_u32(ap,address << RISCVCS_ADDRESS_SHIFT,value);
 }
 
@@ -5284,6 +5453,73 @@ static int dmi_write_fast(struct target *target, uint32_t address, uint32_t valu
 	riscv013_info_t *info = get_info(target);
 	struct adiv5_ap *ap = info->debug_ap;
 	return mem_ap_write_u32_fast(ap,address << RISCVCS_ADDRESS_SHIFT,value);
+}
+
+/* CPU-view RAM access: avoids stale AP1 data with write-back D-cache.
+ * Every transfer is checked and temporary GPRs are restored on errors.
+ */
+static int checked_memory_progbuf(struct target *target, target_addr_t address,
+		uint32_t size, uint32_t count, uint32_t increment,
+		uint8_t *read_buffer, const uint8_t *write_buffer)
+{
+	if (target->state != TARGET_HALTED)
+		return ERROR_TARGET_NOT_HALTED;
+	if (size != 1 && size != 2 && size != 4)
+		return ERROR_TARGET_UNALIGNED_ACCESS;
+	if (!count)
+		return ERROR_OK;
+	if ((address % size) || (increment % size))
+		return ERROR_TARGET_UNALIGNED_ACCESS;
+	if (address > UINT32_MAX ||
+			(uint64_t)(count - 1) * increment + size > (UINT64_C(1) << 32) - address)
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	uint64_t s0, s1;
+
+	if (register_read_direct(target, &s0, GDB_REGNO_S0) != ERROR_OK ||
+			register_read_direct(target, &s1, GDB_REGNO_S1) != ERROR_OK)
+		return ERROR_FAIL;
+	struct riscv_program program;
+
+	riscv_program_init(&program, target);
+	if (write_buffer) {
+		if (size == 1)
+			riscv_program_sbr(&program, GDB_REGNO_S1, GDB_REGNO_S0, 0);
+		else if (size == 2)
+			riscv_program_shr(&program, GDB_REGNO_S1, GDB_REGNO_S0, 0);
+		else
+			riscv_program_swr(&program, GDB_REGNO_S1, GDB_REGNO_S0, 0);
+	} else {
+		if (size == 1)
+			riscv_program_lbr(&program, GDB_REGNO_S1, GDB_REGNO_S0, 0);
+		else if (size == 2)
+			riscv_program_lhr(&program, GDB_REGNO_S1, GDB_REGNO_S0, 0);
+		else
+			riscv_program_lwr(&program, GDB_REGNO_S1, GDB_REGNO_S0, 0);
+	}
+	int ret = riscv_program_ebreak(&program);
+
+	if (ret == ERROR_OK)
+		ret = riscv_program_write(&program);
+	for (uint32_t i = 0; i < count && ret == ERROR_OK; ++i) {
+		ret = register_write_direct(target, GDB_REGNO_S0, address + (uint64_t)i * increment);
+		if (ret == ERROR_OK && write_buffer)
+			ret = register_write_direct(target, GDB_REGNO_S1,
+					buf_get_u32(write_buffer + i * size, 0, size * 8));
+		if (ret == ERROR_OK)
+			ret = riscv_execute_debug_buffer(target);
+		if (ret == ERROR_OK && read_buffer) {
+			uint64_t value;
+
+			ret = register_read_direct(target, &value, GDB_REGNO_S1);
+			if (ret == ERROR_OK)
+				buf_set_u32(read_buffer + i * size, 0, size * 8, value);
+		}
+		keep_alive();
+	}
+	int restore0 = register_write_direct(target, GDB_REGNO_S0, s0);
+	int restore1 = register_write_direct(target, GDB_REGNO_S1, s1);
+	return ret == ERROR_OK && restore0 == ERROR_OK &&
+			restore1 == ERROR_OK ? ERROR_OK : ERROR_FAIL;
 }
 
 static int read_memory_progbuf_inner(struct target *target, target_addr_t address,

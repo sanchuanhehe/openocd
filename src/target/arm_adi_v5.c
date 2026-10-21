@@ -1116,11 +1116,13 @@ int dap_find_ap_num(struct adiv5_dap *dap, enum ap_type type_to_find, struct adi
 	/* read the IDR register of the Access Port */
 	uint32_t id_val = 0;
 
-	int retval = dap_queue_ap_read(dap_get_ap(dap, ap_num), ADIV5_AP_REG_IDR, &id_val);
-	if (retval != ERROR_OK)
-		return retval;
-
-	retval = dap_run(dap);
+	*ap_out = NULL;
+	struct adiv5_ap *ap = dap_get_ap(dap, ap_num);
+	if (!ap)
+		return ERROR_FAIL;
+	int retval = dap_queue_ap_read(ap, ADIV5_AP_REG_IDR, &id_val);
+	if (retval == ERROR_OK)
+		retval = dap_run(dap);
 
 	/* IDR bits:
 	* 31-28 : Revision
@@ -1134,7 +1136,7 @@ int dap_find_ap_num(struct adiv5_dap *dap, enum ap_type type_to_find, struct adi
 
 	if ((retval == ERROR_OK) &&                  /* Register read success */
 			((id_val & 0x0ff00000) == 0x04700000) && /* Jedec codes match */
-			((id_val & IDR_TYPE) == 2)) {      /* type matches*/
+			((id_val & IDR_TYPE) == (type_to_find & IDR_TYPE))) {      /* type matches*/
 
 		LOG_DEBUG("Found %s at AP index: %d (IDR=0x%08" PRIX32 ")",
 					(type_to_find == AP_TYPE_AHB3_AP) ? "AHB3-AP" :
@@ -1143,11 +1145,12 @@ int dap_find_ap_num(struct adiv5_dap *dap, enum ap_type type_to_find, struct adi
 					(type_to_find == AP_TYPE_AXI_AP)  ? "AXI-AP"  :
 					(type_to_find == AP_TYPE_JTAG_AP) ? "JTAG-AP" : "Unknown",
 						ap_num, id_val);
-		*ap_out = &dap->ap[ap_num];
+		*ap_out = ap;
 		return ERROR_OK;
 	}
 
-	LOG_ERROR("No %s found at debug_ap[%d]",
+	dap_put_ap(ap);
+	LOG_DEBUG("No %s found at debug_ap[%d]",
 			(type_to_find == AP_TYPE_AHB3_AP) ? "AHB3-AP" :
 			(type_to_find == AP_TYPE_AHB5_AP) ? "AHB5-AP" :
 			(type_to_find == AP_TYPE_APB_AP)  ? "APB-AP"  :

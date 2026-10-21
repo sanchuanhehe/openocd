@@ -50,14 +50,23 @@ struct rtos {
 	void *rtos_specific_params;
 };
 
+extern struct rtos_type liteos_ws63_rtos;
+int liteos_ws63_symbols(struct command_invocation *cmd);
+bool rtos_register_view_read_only(struct target *target);
+
 struct rtos_reg {
 	uint32_t number;
 	uint32_t size;
 	uint8_t value[16];
+	/* Emit GDB unavailable bytes for registers not saved by the scheduler. */
+	bool unavailable;
 };
 
 struct rtos_type {
 	const char *name;
+	bool thread_registers_read_only;
+	/* Only these drivers initialize rtos_reg.unavailable. */
+	bool supports_unavailable_registers;
 	bool (*detect_rtos)(struct target *target);
 	int (*create)(struct target *target);
 	int (*smp_init)(struct target *target);

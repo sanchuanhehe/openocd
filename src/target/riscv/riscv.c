@@ -18,6 +18,7 @@
 #include "target/register.h"
 #include "target/breakpoints.h"
 #include "riscv.h"
+#include "ws63_insn.h"
 #include "gdb_regs.h"
 #include "rtos/rtos.h"
 #include "debug_defines.h"
@@ -492,6 +493,8 @@ static void riscv_free_registers(struct target *target)
 
 static void riscv_deinit_target(struct target *target)
 {
+	if (riscv_info(target)->ws63_ap1)
+		dap_put_ap(riscv_info(target)->ws63_ap1);
 	LOG_DEBUG("riscv_deinit_target()");
 
 	struct riscv_info *info = target->arch_info;
@@ -690,8 +693,103 @@ static int maybe_add_trigger_t6(struct target *target,
 	return ERROR_OK;
 }
 
+/* WS63 uses type-2 triggers. Check both control and address readback before
+ * claiming a slot, including NAPOT ranges for split watchpoints.
+ */
+static int ws63_add_trigger(struct target *target, struct trigger *trigger)
+{
+	RISCV_INFO(r);
+	if (riscv_enumerate_triggers(target) != ERROR_OK)
+		return ERROR_FAIL;
+	riscv_reg_t saved;
+
+	if (riscv_get_register(target, &saved, GDB_REGNO_TSELECT) != ERROR_OK)
+		return ERROR_FAIL;
+	int ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+
+	for (unsigned int i = 0; i < r->trigger_count; ++i) {
+		if (r->trigger_unique_id[i] != -1)
+			continue;
+		riscv_reg_t old, control, address = trigger->address, rb1, rb2;
+
+		ret = riscv_set_register(target, GDB_REGNO_TSELECT, i);
+		if (ret != ERROR_OK || riscv_get_register(target, &old,
+				GDB_REGNO_TDATA1) != ERROR_OK) {
+			ret = ERROR_FAIL;
+			break;
+		}
+		ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		if (get_field(old, MCONTROL_TYPE(32)) != 2 ||
+				(old & (MCONTROL_EXECUTE | MCONTROL_LOAD | MCONTROL_STORE)))
+			continue;
+		control = set_field(MCONTROL_DMODE(32) | MCONTROL_M, MCONTROL_TYPE(32), 2);
+		control = set_field(control, MCONTROL_ACTION, MCONTROL_ACTION_DEBUG_MODE);
+		if (riscv_supports_extension(target, 'U'))
+			control |= MCONTROL_U;
+		if (trigger->execute)
+			control |= MCONTROL_EXECUTE;
+		if (trigger->read)
+			control |= MCONTROL_LOAD;
+		if (trigger->write)
+			control |= MCONTROL_STORE;
+		if (!trigger->execute && trigger->length > 1) {
+			control = set_field(control, MCONTROL_MATCH, MCONTROL_MATCH_NAPOT);
+			address |= trigger->length / 2 - 1;
+		}
+		ret = riscv_set_register(target, GDB_REGNO_TDATA1, 0);
+		if (ret == ERROR_OK)
+			ret = riscv_set_register(target, GDB_REGNO_TDATA2, address);
+		if (ret == ERROR_OK)
+			ret = riscv_set_register(target, GDB_REGNO_TDATA1, control);
+		if (ret == ERROR_OK)
+			ret = riscv_get_register(target, &rb1, GDB_REGNO_TDATA1);
+		if (ret == ERROR_OK)
+			ret = riscv_get_register(target, &rb2, GDB_REGNO_TDATA2);
+		if (ret == ERROR_OK && (rb1 & ~MCONTROL_MASKMAX(32)) == control && rb2 == address) {
+			r->trigger_unique_id[i] = trigger->unique_id;
+			break;
+		}
+		int cleanup = riscv_set_register(target, GDB_REGNO_TDATA1, 0);
+
+		if (ret != ERROR_OK || cleanup != ERROR_OK) {
+			ret = ERROR_FAIL;
+			break;
+		}
+		ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+	if (riscv_set_register(target, GDB_REGNO_TSELECT, saved) != ERROR_OK)
+		return ERROR_FAIL;
+	return ret;
+}
+
+static int ws63_remove_trigger(struct target *target, int id)
+{
+	RISCV_INFO(r);
+	riscv_reg_t saved;
+
+	if (riscv_get_register(target, &saved, GDB_REGNO_TSELECT) != ERROR_OK)
+		return ERROR_FAIL;
+	int ret = ERROR_OK;
+
+	for (unsigned int i = 0; i < r->trigger_count; ++i) {
+		if (r->trigger_unique_id[i] != id)
+			continue;
+		ret = riscv_set_register(target, GDB_REGNO_TSELECT, i);
+		if (ret == ERROR_OK)
+			ret = riscv_set_register(target, GDB_REGNO_TDATA1, 0);
+		if (ret != ERROR_OK)
+			break;
+		r->trigger_unique_id[i] = -1;
+	}
+	if (riscv_set_register(target, GDB_REGNO_TSELECT, saved) != ERROR_OK)
+		return ERROR_FAIL;
+	return ret;
+}
+
 static int add_trigger(struct target *target, struct trigger *trigger)
 {
+	if (riscv_info(target)->ws63)
+		return ws63_add_trigger(target, trigger);
 	RISCV_INFO(r);
 
 	if (riscv_enumerate_triggers(target) != ERROR_OK)
@@ -866,10 +964,60 @@ int riscv_read_by_any_size(struct target *target, target_addr_t address, uint32_
 	return ERROR_FAIL;
 }
 
+int riscv_ws63_sync(struct target *target)
+{
+	int ret = riscv_set_register(target, GDB_REGNO_CSR0 + 0x7c3, 12);
+
+	if (ret == ERROR_OK)
+		ret = riscv_set_register(target, GDB_REGNO_CSR0 + 0x7c2, 4);
+	return ret;
+}
+
+int riscv_ws63_check_write(struct target *target, target_addr_t address, uint64_t length)
+{
+	if (!riscv_info(target)->ws63 || riscv_info(target)->ws63_patching_breakpoint || !length)
+		return ERROR_OK;
+	for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
+		if (bp->type != BKPT_SOFT || !bp->is_set)
+			continue;
+		/* Subtraction avoids wrapping at the end of the target address space. */
+		bool overlap = address <= bp->address ? bp->address - address < length :
+			address - bp->address < (unsigned int)bp->length;
+		if (overlap) {
+			LOG_ERROR("Remove software breakpoint at " TARGET_ADDR_FMT
+				" before writing or erasing this range", bp->address);
+			return ERROR_FAIL;
+		}
+	}
+	return ERROR_OK;
+}
+
+static int riscv_breakpoint_write(struct target *target, target_addr_t address,
+		uint32_t size, uint8_t *data)
+{
+	RISCV_INFO(r);
+	bool patching = r->ws63_patching_breakpoint;
+
+	r->ws63_patching_breakpoint = true;
+	int ret;
+
+	if (riscv_info(target)->ws63 && address >= 0x200000 && address < 0x600000)
+		ret = ws63_flash_patch(target, address, data, size);
+	else
+		ret = riscv_write_by_any_size(target, address, size, data);
+	r->ws63_patching_breakpoint = patching;
+	return ret;
+}
+
 static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakpoint)
 {
-	LOG_DEBUG("[%d] @0x%" TARGET_PRIxADDR, target->coreid, breakpoint->address);
+	LOG_DEBUG("@0x%" TARGET_PRIxADDR, breakpoint->address);
 	assert(breakpoint);
+	if (riscv_info(target)->ws63 && breakpoint->type == BKPT_SOFT &&
+			((breakpoint->address >= 0x100000 && breakpoint->address < 0x14c000) ||
+			(breakpoint->address >= 0x200000 && breakpoint->address < 0x600000 &&
+			!riscv_info(target)->ws63_flash_breakpoints)))
+		breakpoint->type = BKPT_HARD;
 	if (breakpoint->type == BKPT_SOFT) {
 		/** @todo check RVC for size/alignment */
 		if (!(breakpoint->length == 4 || breakpoint->length == 2)) {
@@ -878,26 +1026,31 @@ static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakp
 		}
 
 		if (0 != (breakpoint->address % 2)) {
-			LOG_ERROR("Invalid breakpoint alignment for address 0x%" TARGET_PRIxADDR, breakpoint->address);
+			LOG_ERROR("Invalid breakpoint alignment for address 0x%" TARGET_PRIxADDR,
+				breakpoint->address);
 			return ERROR_FAIL;
 		}
 
 		/* Read the original instruction. */
 		if (riscv_read_by_any_size(
-				target, breakpoint->address, breakpoint->length, breakpoint->orig_instr) != ERROR_OK) {
+				target, breakpoint->address, breakpoint->length,
+						breakpoint->orig_instr) != ERROR_OK) {
 			LOG_ERROR("Failed to read original instruction at 0x%" TARGET_PRIxADDR,
 					breakpoint->address);
 			return ERROR_FAIL;
 		}
 
 		uint8_t buff[4] = { 0 };
-		buf_set_u32(buff, 0, breakpoint->length * CHAR_BIT, breakpoint->length == 4 ? ebreak() : ebreak_c());
+		buf_set_u32(buff, 0, breakpoint->length * CHAR_BIT,
+				breakpoint->length == 4 ? ebreak() : ebreak_c());
 		/* Write the ebreak instruction. */
-		if (riscv_write_by_any_size(target, breakpoint->address, breakpoint->length, buff) != ERROR_OK) {
+		if (riscv_breakpoint_write(target, breakpoint->address, breakpoint->length,
+				buff) != ERROR_OK) {
 			LOG_ERROR("Failed to write %d-byte breakpoint instruction at 0x%"
 					TARGET_PRIxADDR, breakpoint->length, breakpoint->address);
 			return ERROR_FAIL;
 		}
+		breakpoint->is_set = true;
 
 	} else if (breakpoint->type == BKPT_HARD) {
 		struct trigger trigger;
@@ -905,17 +1058,20 @@ static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakp
 		int const result = add_trigger(target, &trigger);
 		if (result != ERROR_OK)
 			return result;
+
+
+		breakpoint->is_set = true;
 	} else {
 		LOG_INFO("OpenOCD only supports hardware and software breakpoints.");
 		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
 	}
-
-	breakpoint->is_set = true;
 	return ERROR_OK;
 }
 
 static int remove_trigger(struct target *target, struct trigger *trigger)
 {
+	if (riscv_info(target)->ws63)
+		return ws63_remove_trigger(target, trigger->unique_id);
 	RISCV_INFO(r);
 
 	if (riscv_enumerate_triggers(target) != ERROR_OK)
@@ -949,10 +1105,32 @@ static int remove_trigger(struct target *target, struct trigger *trigger)
 static int riscv_remove_breakpoint(struct target *target,
 		struct breakpoint *breakpoint)
 {
+	if (riscv_info(target)->ws63 && !breakpoint->is_set)
+		return ERROR_OK;
 	if (breakpoint->type == BKPT_SOFT) {
+		if (riscv_info(target)->ws63) {
+			uint8_t actual[4], expected[4] = {0};
+
+			if (breakpoint->length != 2 && breakpoint->length != 4)
+				return ERROR_FAIL;
+			int ret = riscv_read_by_any_size(target, breakpoint->address,
+					breakpoint->length, actual);
+
+			if (ret != ERROR_OK)
+				return ret;
+			buf_set_u32(expected, 0, breakpoint->length * CHAR_BIT,
+				breakpoint->length == 4 ? ebreak() : ebreak_c());
+			if (memcmp(actual, expected, breakpoint->length)) {
+				LOG_WARNING("Software breakpoint at " TARGET_ADDR_FMT
+					" was overwritten; preserving current instruction",
+							breakpoint->address);
+				breakpoint->is_set = false;
+				return ERROR_OK;
+			}
+		}
 		/* Write the original instruction. */
-		if (riscv_write_by_any_size(
-				target, breakpoint->address, breakpoint->length, breakpoint->orig_instr) != ERROR_OK) {
+		if (riscv_breakpoint_write(target, breakpoint->address,
+				breakpoint->length, breakpoint->orig_instr) != ERROR_OK) {
 			LOG_ERROR("Failed to restore instruction for %d-byte breakpoint at "
 					"0x%" TARGET_PRIxADDR, breakpoint->length, breakpoint->address);
 			return ERROR_FAIL;
@@ -989,14 +1167,58 @@ static void trigger_from_watchpoint(struct trigger *trigger,
 	trigger->unique_id = watchpoint->unique_id;
 }
 
+static bool ws63_has_trigger(struct target *target, int id)
+{
+	RISCV_INFO(r);
+	for (unsigned int i = 0; i < r->trigger_count; ++i)
+		if (r->trigger_unique_id[i] == id)
+			return true;
+	return false;
+}
+
 int riscv_add_watchpoint(struct target *target, struct watchpoint *watchpoint)
 {
+	if (riscv_info(target)->ws63 && watchpoint->mask != 0xffffffffU) {
+		LOG_ERROR("Watchpoints on data values are not implemented");
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
 	struct trigger trigger;
 	trigger_from_watchpoint(&trigger, watchpoint);
 
-	int result = add_trigger(target, &trigger);
+	int result;
+
+	if (riscv_info(target)->ws63) {
+		if (!watchpoint->length || watchpoint->address >= (UINT64_C(1) << 32) ||
+				watchpoint->length > (UINT64_C(1) << 32) - watchpoint->address)
+			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		uint64_t end = (watchpoint->address + watchpoint->length + 3) & ~UINT64_C(3);
+		uint64_t pos = watchpoint->address & ~UINT64_C(3);
+
+		result = ERROR_OK;
+		while (pos < end) {
+			uint64_t size = 4;
+
+			while (size * 2 <= end - pos && !(pos % (size * 2)))
+				size *= 2;
+			trigger.address = pos;
+			trigger.length = size;
+			result = add_trigger(target, &trigger);
+			if (result != ERROR_OK) {
+				if (ws63_has_trigger(target, watchpoint->unique_id) &&
+						remove_trigger(target, &trigger) != ERROR_OK)
+					return ERROR_FAIL;
+				break;
+			}
+			pos += size;
+		}
+	} else {
+		result = add_trigger(target, &trigger);
+	}
 	if (result != ERROR_OK)
 		return result;
+
+
 	watchpoint->is_set = true;
 
 	return ERROR_OK;
@@ -1024,8 +1246,77 @@ int riscv_remove_watchpoint(struct target *target,
  * The GDB server uses this information to tell GDB what data address has
  * been hit, which enables GDB to print the hit variable along with its old
  * and new value. */
+int riscv_hisilicon_rearm(struct target *target)
+{
+	RISCV_INFO(r);
+	if ((!r->ws63 && !r->ws53) || !r->hisilicon_rearm)
+		return ERROR_OK;
+	/* Reset erased hardware triggers; forget their old ownership first. */
+	for (unsigned int i = 0; i < r->trigger_count; ++i)
+		r->trigger_unique_id[i] = -1;
+	for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
+		if (bp->type != BKPT_HARD)
+			continue;
+		bp->is_set = false;
+		int ret = riscv_add_breakpoint(target, bp);
+
+		if (ret != ERROR_OK)
+			return ret;
+	}
+	for (struct watchpoint *wp = target->watchpoints; wp; wp = wp->next) {
+		wp->is_set = false;
+		int ret = riscv_add_watchpoint(target, wp);
+
+		if (ret != ERROR_OK)
+			return ret;
+	}
+	r->hisilicon_rearm = false;
+	return ERROR_OK;
+}
+
+static int ws63_watch_hit(struct target *target, struct watchpoint **hit, bool *guard)
+{
+	*hit = NULL;
+	*guard = false;
+	riscv_reg_t pc, base;
+	uint8_t bytes[4];
+
+	if (riscv_get_register(target, &pc, GDB_REGNO_PC) != ERROR_OK ||
+			target_read_buffer(target, pc, 4, bytes) != ERROR_OK)
+		return ERROR_FAIL;
+	struct ws63_access access;
+
+	if (!ws63_decode_access(le_to_h_u32(bytes), &access))
+		return ERROR_OK;
+	if (riscv_get_register(target, &base, access.base) != ERROR_OK)
+		return ERROR_FAIL;
+	uint64_t addr = (uint32_t)(base + access.offset);
+
+	if (addr % access.size || addr + access.size > (UINT64_C(1) << 32))
+		return ERROR_OK;
+	for (struct watchpoint *wp = target->watchpoints; wp; wp = wp->next) {
+		if ((wp->rw == WPT_READ && !access.load) || (wp->rw == WPT_WRITE && access.load))
+			continue;
+		if (addr < wp->address + wp->length && wp->address < addr + access.size) {
+			*hit = wp;
+			return ERROR_OK;
+		}
+		uint64_t low = wp->address & ~UINT64_C(3);
+		uint64_t end = (wp->address + wp->length + 3) & ~UINT64_C(3);
+
+		if (addr >= low && addr < end)
+			*guard = true;
+	}
+	return ERROR_OK;
+}
+
 static int riscv_hit_watchpoint(struct target *target, struct watchpoint **hit_watchpoint)
 {
+	if (riscv_info(target)->ws63) {
+		bool guard;
+		int ret = ws63_watch_hit(target, hit_watchpoint, &guard);
+		return ret == ERROR_OK && *hit_watchpoint ? ERROR_OK : ERROR_FAIL;
+	}
 	struct watchpoint *wp = target->watchpoints;
 
 	LOG_DEBUG("Current hartid = %d", riscv_current_hartid(target));
@@ -1108,9 +1399,26 @@ static int oldriscv_step(struct target *target, int current, uint32_t address,
 	return tt->step(target, current, address, handle_breakpoints);
 }
 
+static int ws63_can_run(struct target *target)
+{
+	if (riscv_info(target)->ws63 &&
+			(riscv_info(target)->ws63_flash_failed ||
+					riscv_info(target)->ws63_flash_changed)) {
+		LOG_ERROR("Recover failed Flash writes and reset after programming before running");
+		return ERROR_FAIL;
+	}
+	return ERROR_OK;
+}
+
+static int hisilicon_step(struct target *target, bool current, target_addr_t address, bool callbacks);
+
 static int old_or_new_riscv_step(struct target *target, int current,
 		target_addr_t address, int handle_breakpoints)
 {
+	if (riscv_info(target)->ws63 || riscv_info(target)->ws53)
+		return hisilicon_step(target, current, address, true);
+	if (ws63_can_run(target) != ERROR_OK)
+		return ERROR_FAIL;
 	RISCV_INFO(r);
 	LOG_DEBUG("handle_breakpoints=%d", handle_breakpoints);
 	if (!r->is_halted)
@@ -1278,18 +1586,78 @@ int riscv_halt(struct target *target)
 
 static int riscv_assert_reset(struct target *target)
 {
+	if (riscv_info(target)->ws63 || riscv_info(target)->ws53) {
+		if (riscv_info(target)->ws63_flash_failed) {
+			LOG_ERROR("Recover the failed Flash operation before reset");
+			return ERROR_FAIL;
+		}
+		for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
+			if (bp->type != BKPT_SOFT)
+				continue;
+			if (target->state != TARGET_HALTED &&
+					(riscv_halt(target) != ERROR_OK ||
+							target->state != TARGET_HALTED))
+				return ERROR_FAIL;
+			/* Hardware breakpoints survive boot verification and RAM reinitialization.
+			 * Reserve the trigger before changing the installed software breakpoint.
+			 */
+			struct breakpoint hardware = *bp;
+
+			hardware.type = BKPT_HARD;
+			hardware.is_set = false;
+			if (riscv_add_breakpoint(target, &hardware) != ERROR_OK) {
+				LOG_ERROR("Reset needs a hardware slot for software breakpoint at "
+					TARGET_ADDR_FMT "; remove a breakpoint/watchpoint and retry",
+					bp->address);
+				return ERROR_FAIL;
+			}
+			if (riscv_remove_breakpoint(target, bp) != ERROR_OK) {
+				if (riscv_remove_breakpoint(target, &hardware) != ERROR_OK)
+					LOG_ERROR("Failed to release reset breakpoint trigger");
+				return ERROR_FAIL;
+			}
+			bp->type = BKPT_HARD;
+			bp->is_set = true;
+			LOG_INFO("Converted software breakpoint at " TARGET_ADDR_FMT
+				" to hardware for reset", bp->address);
+		}
+	}
 	LOG_DEBUG("[%d]", target->coreid);
 	LOG_DEBUG("RISCV ASSERT RESET");
 	struct target_type *tt = get_target_type(target);
 	riscv_invalidate_register_cache(target);
-	return tt->assert_reset(target);
+	bool halt = target->reset_halt;
+
+	if (riscv_info(target)->ws63 || riscv_info(target)->ws53)
+		target->reset_halt = true;
+	int ret = tt->assert_reset(target);
+
+	target->reset_halt = halt;
+	if (ret == ERROR_OK && (riscv_info(target)->ws63 || riscv_info(target)->ws53)) {
+		riscv_info(target)->ws63_flash_changed = false;
+		riscv_info(target)->hisilicon_rearm = true;
+	}
+	return ret;
 }
 
 static int riscv_deassert_reset(struct target *target)
 {
 	LOG_DEBUG("[%d]", target->coreid);
 	struct target_type *tt = get_target_type(target);
-	return tt->deassert_reset(target);
+	bool halt = target->reset_halt;
+
+	if (riscv_info(target)->ws63 || riscv_info(target)->ws53)
+		target->reset_halt = true;
+	int ret = tt->deassert_reset(target);
+
+	target->reset_halt = halt;
+	if (ret != ERROR_OK || (!riscv_info(target)->ws63 && !riscv_info(target)->ws53))
+		return ret;
+	riscv_invalidate_register_cache(target);
+	ret = riscv_hisilicon_rearm(target);
+	if (ret == ERROR_OK && !halt)
+		ret = target_resume(target, true, 0, true, false);
+	return ret;
 }
 
 static int riscv_resume_prep_all_harts(struct target *target)
@@ -1323,7 +1691,7 @@ static int disable_triggers(struct target *target, riscv_reg_t *state)
 	if (riscv_enumerate_triggers(target) != ERROR_OK)
 		return ERROR_FAIL;
 
-	if (r->manual_hwbp_set) {
+	if (r->manual_hwbp_set || r->ws63 || r->ws53) {
 		/* Look at every trigger that may have been set. */
 		riscv_reg_t tselect;
 		if (riscv_get_register(target, &tselect, GDB_REGNO_TSELECT) != ERROR_OK)
@@ -1366,7 +1734,7 @@ static int enable_triggers(struct target *target, riscv_reg_t *state)
 {
 	RISCV_INFO(r);
 
-	if (r->manual_hwbp_set) {
+	if (r->manual_hwbp_set || r->ws63 || r->ws53) {
 		/* Look at every trigger that may have been set. */
 		riscv_reg_t tselect;
 		if (riscv_get_register(target, &tselect, GDB_REGNO_TSELECT) != ERROR_OK)
@@ -1399,6 +1767,52 @@ static int enable_triggers(struct target *target, riscv_reg_t *state)
 	return ERROR_OK;
 }
 
+/* Restore the original instruction for one step, then reinstall it even when
+ * the step fails. Internal step-over must not send spurious GDB stop replies.
+ */
+static int hisilicon_step(struct target *target, bool current, target_addr_t address, bool callbacks)
+{
+	if ((riscv_info(target)->ws63 && ws63_can_run(target) != ERROR_OK) ||
+			riscv_hisilicon_rearm(target) != ERROR_OK)
+		return ERROR_FAIL;
+	if (!current && riscv_set_register(target, GDB_REGNO_PC, address) != ERROR_OK)
+		return ERROR_FAIL;
+	riscv_reg_t pc;
+
+	if (riscv_get_register(target, &pc, GDB_REGNO_PC) != ERROR_OK)
+		return ERROR_FAIL;
+	struct breakpoint *sw = NULL;
+
+	for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
+		if (bp->type == BKPT_SOFT && bp->is_set && bp->address == pc) {
+			if (riscv_remove_breakpoint(target, bp) != ERROR_OK)
+				return ERROR_FAIL;
+			sw = bp;
+			break;
+		}
+	}
+	riscv_reg_t triggers[RISCV_MAX_HWBPS] = {0};
+	int ret = disable_triggers(target, triggers);
+
+	if (ret == ERROR_OK)
+		ret = riscv_step_rtos_hart(target);
+	int restore = enable_triggers(target, triggers);
+
+	if (sw && riscv_add_breakpoint(target, sw) != ERROR_OK)
+		restore = ERROR_FAIL;
+	if (ret != ERROR_OK || restore != ERROR_OK)
+		return ERROR_FAIL;
+	target->state = TARGET_HALTED;
+	target->debug_reason = DBG_REASON_SINGLESTEP;
+	if (callbacks) {
+		target->state = TARGET_RUNNING;
+		target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
+		target->state = TARGET_HALTED;
+		target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+	}
+	return ERROR_OK;
+}
+
 /**
  * Get everything ready to resume.
  */
@@ -1411,7 +1825,19 @@ static int resume_prep(struct target *target, int current,
 	if (!current)
 		riscv_set_register(target, GDB_REGNO_PC, address);
 
-	if (target->debug_reason == DBG_REASON_WATCHPOINT) {
+	if ((r->ws63 || r->ws53) && current && handle_breakpoints) {
+		riscv_reg_t pc;
+
+		if (riscv_get_register(target, &pc, GDB_REGNO_PC) != ERROR_OK)
+			return ERROR_FAIL;
+		bool step = target->debug_reason == DBG_REASON_WATCHPOINT;
+
+		if (target->debug_reason == DBG_REASON_BREAKPOINT)
+			for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next)
+				step |= bp->is_set && bp->address == pc;
+		if (step && hisilicon_step(target, true, 0, false) != ERROR_OK)
+			return ERROR_FAIL;
+	} else if (!r->ws63 && !r->ws53 && target->debug_reason == DBG_REASON_WATCHPOINT) {
 		/* To be able to run off a trigger, disable all the triggers, step, and
 		 * then resume as usual. */
 		riscv_reg_t trigger_state[RISCV_MAX_HWBPS] = {0};
@@ -1478,6 +1904,8 @@ static int riscv_resume(
 		int debug_execution,
 		bool single_hart)
 {
+	if (ws63_can_run(target) != ERROR_OK)
+		return ERROR_FAIL;
 	LOG_DEBUG("handle_breakpoints=%d", handle_breakpoints);
 	int result = ERROR_OK;
 	if (target->smp && !single_hart) {
@@ -1695,9 +2123,48 @@ static int riscv_virt2phys(struct target *target, target_addr_t virtual, target_
 	return ERROR_FAIL;
 }
 
+static bool ws63_bus_address(target_addr_t address, uint64_t length)
+{
+	return (address >= 0x100000 && address < 0x14c000 && length <= 0x14c000 - address) ||
+		(address >= 0x200000 && address < 0x600000 && length <= 0x600000 - address) ||
+		(address >= 0x40000000 && address < 0x60000000 && length <= 0x60000000 - address);
+}
+
+static int ws63_bus_init(struct target *target)
+{
+	RISCV_INFO(r);
+	if (r->ws63_ap1)
+		return ERROR_OK;
+	struct adiv5_private_config *pc = (struct adiv5_private_config *)target->private_config;
+
+	if (!pc->dap)
+		return ERROR_FAIL;
+	r->ws63_ap1 = dap_get_ap(pc->dap, 1);
+	if (!r->ws63_ap1)
+		return ERROR_FAIL;
+	int ret = mem_ap_init(r->ws63_ap1);
+
+	if (ret != ERROR_OK) {
+		dap_put_ap(r->ws63_ap1);
+		r->ws63_ap1 = NULL;
+	}
+	return ret;
+}
+
 static int riscv_read_phys_memory(struct target *target, target_addr_t phys_address,
 			uint32_t size, uint32_t count, uint8_t *buffer)
 {
+	if (riscv_info(target)->ws63 && (phys_address > UINT32_MAX ||
+			(uint64_t)size * count > (UINT64_C(1) << 32) - phys_address))
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	if (riscv_info(target)->ws63 && ws63_bus_address(phys_address, (uint64_t)size * count)) {
+		int ret = ws63_bus_init(target);
+
+		if (ret != ERROR_OK)
+			return ret;
+		return mem_ap_read_buf(riscv_info(target)->ws63_ap1, buffer, size, count,
+				phys_address);
+	}
 	RISCV_INFO(r);
 	if (riscv_select_current_hart(target) != ERROR_OK)
 		return ERROR_FAIL;
@@ -1707,6 +2174,16 @@ static int riscv_read_phys_memory(struct target *target, target_addr_t phys_addr
 static int riscv_read_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
 {
+	if (riscv_info(target)->ws63 && (address > UINT32_MAX ||
+			(uint64_t)size * count > (UINT64_C(1) << 32) - address))
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	if (riscv_info(target)->ws63 && ws63_bus_address(address, (uint64_t)size * count)) {
+		int ret = ws63_bus_init(target);
+
+		if (ret != ERROR_OK)
+			return ret;
+		return mem_ap_read_buf(riscv_info(target)->ws63_ap1, buffer, size, count, address);
+	}
 	if (count == 0) {
 		LOG_WARNING("0-length read from 0x%" TARGET_PRIxADDR, address);
 		return ERROR_OK;
@@ -1726,15 +2203,56 @@ static int riscv_read_memory(struct target *target, target_addr_t address,
 static int riscv_write_phys_memory(struct target *target, target_addr_t phys_address,
 			uint32_t size, uint32_t count, const uint8_t *buffer)
 {
+	if (riscv_info(target)->ws63 && (phys_address > UINT32_MAX ||
+			(uint64_t)size * count > (UINT64_C(1) << 32) - phys_address))
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	bool ws63 = riscv_info(target)->ws63;
+
+	if (riscv_ws63_check_write(target, phys_address, (uint64_t)size * count) != ERROR_OK)
+		return ERROR_FAIL;
+	if (ws63 && ((phys_address < 0x14c000 &&
+			phys_address + (uint64_t)size * count > 0x100000) ||
+			(phys_address < 0x600000 &&
+					phys_address + (uint64_t)size * count > 0x200000))) {
+		LOG_ERROR("WS63 ROM is read-only; use flash commands for NOR Flash");
+		return ERROR_FAIL;
+	}
+	if (ws63 && phys_address >= 0x40000000 && ws63_bus_address(phys_address,
+			(uint64_t)size * count)) {
+		int ret = ws63_bus_init(target);
+		return ret == ERROR_OK ? mem_ap_write_buf(riscv_info(target)->ws63_ap1,
+			buffer, size, count, phys_address) : ret;
+	}
 	if (riscv_select_current_hart(target) != ERROR_OK)
 		return ERROR_FAIL;
 	struct target_type *tt = get_target_type(target);
-	return tt->write_memory(target, phys_address, size, count, buffer);
+	int ret = tt->write_memory(target, phys_address, size, count, buffer);
+
+	if (ret == ERROR_OK && ws63)
+		ret = riscv_ws63_sync(target);
+	return ret;
 }
 
 static int riscv_write_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
+	if (riscv_info(target)->ws63 && (address > UINT32_MAX ||
+			(uint64_t)size * count > (UINT64_C(1) << 32) - address))
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	bool ws63 = riscv_info(target)->ws63;
+
+	if (riscv_ws63_check_write(target, address, (uint64_t)size * count) != ERROR_OK)
+		return ERROR_FAIL;
+	if (ws63 && ((address < 0x14c000 && address + (uint64_t)size * count > 0x100000) ||
+			(address < 0x600000 && address + (uint64_t)size * count > 0x200000))) {
+		LOG_ERROR("WS63 ROM is read-only; use flash commands for NOR Flash");
+		return ERROR_FAIL;
+	}
+	if (ws63 && address >= 0x40000000 && ws63_bus_address(address, (uint64_t)size * count)) {
+		int ret = ws63_bus_init(target);
+		return ret == ERROR_OK ? mem_ap_write_buf(riscv_info(target)->ws63_ap1,
+			buffer, size, count, address) : ret;
+	}
 	if (count == 0) {
 		LOG_WARNING("0-length write to 0x%" TARGET_PRIxADDR, address);
 		return ERROR_OK;
@@ -1748,7 +2266,11 @@ static int riscv_write_memory(struct target *target, target_addr_t address,
 		address = physical_addr;
 
 	struct target_type *tt = get_target_type(target);
-	return tt->write_memory(target, address, size, count, buffer);
+	int ret = tt->write_memory(target, address, size, count, buffer);
+
+	if (ret == ERROR_OK && ws63)
+		ret = riscv_ws63_sync(target);
+	return ret;
 }
 
 static const char *riscv_get_gdb_arch(struct target *target)
@@ -2104,6 +2626,21 @@ static enum riscv_poll_hart riscv_poll_hart(struct target *target, int hartid)
 	/* If OpenOCD thinks we're running but this hart is halted then it's time
 	 * to raise an event. */
 	bool halted = riscv_is_halted(target);
+	if ((r->ws63 || r->ws53) && r->hisilicon_rearm && halted) {
+		target->state = TARGET_HALTED;
+		riscv_invalidate_register_cache(target);
+		if (riscv_hisilicon_rearm(target) != ERROR_OK)
+			return RPH_ERROR;
+		if (r->hisilicon_resume_after_reset) {
+			r->hisilicon_resume_after_reset = false;
+			if (r->resume_prep(target) != ERROR_OK || r->resume_go(target) != ERROR_OK)
+				return RPH_ERROR;
+			target->state = TARGET_RUNNING;
+			return RPH_NO_CHANGE;
+		}
+		target->debug_reason = DBG_REASON_DBGRQ;
+		return RPH_DISCOVERED_HALTED;
+	}
 	if (target->state != TARGET_HALTED && halted) {
 		LOG_DEBUG("  triggered a halt");
 		r->on_halt(target);
@@ -2290,6 +2827,19 @@ int riscv_openocd_poll(struct target *target)
 		if (set_debug_reason(target, halt_reason) != ERROR_OK)
 			return ERROR_FAIL;
 		target->state = TARGET_HALTED;
+	}
+
+	if (riscv_info(target)->ws63 && target->debug_reason == DBG_REASON_WATCHPOINT) {
+		struct watchpoint *hit;
+		bool guard;
+
+		if (ws63_watch_hit(target, &hit, &guard) != ERROR_OK)
+			return ERROR_FAIL;
+		if (!hit && guard) {
+			if (hisilicon_step(target, true, 0, false) != ERROR_OK)
+				return ERROR_FAIL;
+			return riscv_resume(target, true, 0, false, false, true);
+		}
 	}
 
 	if (target->debug_reason == DBG_REASON_BREAKPOINT) {
@@ -2938,7 +3488,89 @@ COMMAND_HANDLER(handle_info)
 	return 0;
 }
 
+COMMAND_HANDLER(riscv_ws63_sync_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (!riscv_info(target)->ws63 || CMD_ARGC != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	if (target->state != TARGET_HALTED)
+		return ERROR_TARGET_NOT_HALTED;
+	if (!strcmp(CMD_ARGV[0], "data"))
+		return riscv_set_register(target, GDB_REGNO_CSR0 + 0x7c3, 12);
+	if (!strcmp(CMD_ARGV[0], "code"))
+		return riscv_ws63_sync(target);
+	return ERROR_COMMAND_ARGUMENT_INVALID;
+}
+
+static char *riscv_memory_map(struct target *target);
+
+COMMAND_HANDLER(riscv_ws63_enable)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (CMD_ARGC != 1 || strcmp(target_type_name(target), "riscvcs"))
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	bool enable;
+	COMMAND_PARSE_ON_OFF(CMD_ARGV[0], enable);
+	if (enable && riscv_info(target)->ws53)
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	riscv_info(target)->ws63 = enable;
+	target->type->get_gdb_memory_map = riscv_info(target)->ws63 ? riscv_memory_map : NULL;
+	target->type->get_gdb_arch = (enable || riscv_info(target)->ws53) ? riscv_get_gdb_arch : NULL;
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(riscv_ws53_enable)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (CMD_ARGC != 1 || strcmp(target_type_name(target), "riscvcs"))
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	bool enable;
+	COMMAND_PARSE_ON_OFF(CMD_ARGV[0], enable);
+	if (enable && riscv_info(target)->ws63)
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	riscv_info(target)->ws53 = enable;
+	target->type->get_gdb_arch = (enable || riscv_info(target)->ws63) ? riscv_get_gdb_arch : NULL;
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(riscv_ws63_flash_breakpoints)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (!riscv_info(target)->ws63 || CMD_ARGC != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	COMMAND_PARSE_ON_OFF(CMD_ARGV[0], riscv_info(target)->ws63_flash_breakpoints);
+	return ERROR_OK;
+}
+
 static const struct command_registration riscv_exec_command_handlers[] = {
+	{
+		.name = "ws53", .handler = riscv_ws53_enable, .mode = COMMAND_CONFIG,
+		.usage = "on|off",
+		.help = "Enable WS53 AP1 debug initialization and checked CPU memory access.",
+	},
+	{
+		.name = "ws63_sync", .handler = riscv_ws63_sync_command, .mode = COMMAND_EXEC,
+		.usage = "data|code", .help = "Synchronize WS63 data or code caches while halted.",
+	},
+	{
+		.name = "ws63", .handler = riscv_ws63_enable, .mode = COMMAND_CONFIG,
+		.usage = "on|off",
+				.help = "Enable WS63-specific memory, reset and trigger handling.",
+	},
+	{
+		.name = "ws63_flash_breakpoints", .handler = riscv_ws63_flash_breakpoints,
+		.mode = COMMAND_ANY, .usage = "on|off",
+				.help = "Opt in to WS63 Flash software breakpoints.",
+	},
+	{
+		.name = "ws63_rtos_symbols", .handler = liteos_ws63_symbols,
+		.mode = COMMAND_ANY, .usage = "array count current scheduled interrupt",
+		.help = "Load ELF-derived LiteOS task symbols.",
+	},
 	{
 		.name = "info",
 		.handler = handle_info,
@@ -3222,9 +3854,25 @@ static int riscvcs_target_create(struct target *target, Jim_Interp *interp)
 		LOG_ERROR("adiv5_jim_configure failed!");
 		return ERROR_FAIL;
 	}
- 	return ERROR_OK;
+	riscv_info_init(target, target->arch_info);
+	return ERROR_OK;
 }
 
+
+static char *riscv_memory_map(struct target *target)
+{
+	if (!riscv_info(target)->ws63)
+		return NULL;
+	return alloc_printf("<memory-map>"
+		"<memory type=\"ram\" start=\"0\" length=\"0x100000\"/>"
+		"<memory type=\"rom\" start=\"0x100000\" length=\"0x4c000\"/>"
+		"<memory type=\"ram\" start=\"0x14c000\" length=\"0xb4000\"/>"
+		"<memory type=\"%s\" start=\"0x200000\" length=\"0x400000\">%s</memory>"
+		"<memory type=\"ram\" start=\"0x600000\" length=\"0xffa00000\"/>"
+		"</memory-map>", riscv_info(target)->ws63_flash_enabled ? "flash" : "rom",
+		riscv_info(target)->ws63_flash_enabled ?
+			"<property name=\"blocksize\">0x1000</property>" : "");
+}
 
 struct target_type riscvcs_target = {
 	.name = "riscvcs",
@@ -3335,7 +3983,8 @@ static int riscv_step_rtos_hart(struct target *target)
 		return ERROR_FAIL;
 	}
 	riscv_invalidate_register_cache(target);
-	r->on_step(target);
+	if (r->on_step(target) != ERROR_OK)
+		return ERROR_FAIL;
 	if (r->step_current_hart(target) != ERROR_OK)
 		return ERROR_FAIL;
 	riscv_invalidate_register_cache(target);
@@ -4628,13 +5277,13 @@ static int riscvcs_init_target(struct command_context *cmd_ctx,
 		return ERROR_FAIL;
     }
 	RISCV_INFO(info);
-	riscv_info_init(target, info);
+
 	// according to RISC-V External Debug Support Page65
 	// 1: Version described in spec version 0.13. 
 	info->dtm_version = 1;
 	info->cmd_ctx = cmd_ctx;
 	info->debug_type = RISCV_CORESIGHT;
-	
+
 	riscv_semihosting_init(target);
 
 	target->debug_reason = DBG_REASON_DBGRQ;

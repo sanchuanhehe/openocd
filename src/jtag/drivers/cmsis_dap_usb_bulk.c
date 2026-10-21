@@ -98,14 +98,14 @@ static void PrintUsbPortNum(uint16_t vids[], uint16_t pids[])
 	err = libusb_init(&ctx);
 	if (err) {
 		LOG_ERROR("libusb initialization failed: %s", libusb_strerror(err));
-		return ERROR_FAIL;
+		return;
 	}
 
 	int num_devices = libusb_get_device_list(ctx, &device_list);
 	if (num_devices < 0) {
 		LOG_ERROR("could not enumerate USB devices: %s", libusb_strerror(num_devices));
 		libusb_exit(ctx);
-		return ERROR_FAIL;
+		return;
 	}
 
 	for (int i = 0; i < num_devices; i++) {
@@ -130,7 +130,7 @@ static void PrintUsbPortNum(uint16_t vids[], uint16_t pids[])
 	    }
 	    LOG_INFO("usb %d port end", i);
 	}
-	return ERROR_OK;
+	return;
 }
 
 static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t pids[], const char *serial,
